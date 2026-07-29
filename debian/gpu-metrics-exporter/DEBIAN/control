@@ -1,0 +1,8 @@
+Package: gpu-metrics-exporter
+Version: __VERSION__
+Architecture: amd64
+Maintainer: irqlevel@gmail.com
+Section: utils
+Priority: optional
+Description: GPU metrics exporter for MWS GPU VMs
+ Ships NVIDIA GPU metrics from inside a guest VM to the host over AF_VSOCK.

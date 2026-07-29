@@ -1,0 +1,8 @@
+/gpu-metrics-exporter
+/gpu-metrics-receiver
+
+bin/
+dist/
+
+# Claude Code local settings (personal, not shared)
+.claude/settings.local.json

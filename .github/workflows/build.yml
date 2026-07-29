@@ -1,0 +1,96 @@
+name: build
+
+# Run tests, then build linux/amd64 binaries on every branch push / MR (not published).
+# On a tag push, run tests then build .deb packages with the version taken from
+# the tag (tags look like 2026.06.08-2) and attach them to a GitHub Release.
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - '*'
+  pull_request:
+  workflow_dispatch:
+
+# Cancel superseded branch/PR runs; never cancel in-progress tag runs.
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+permissions:
+  contents: write   # needed by the tag job to create a Release
+
+jobs:
+  # ── commit / MR: build binaries, upload as workflow artifact, do NOT publish ──
+  binaries:
+    if: github.event_name == 'pull_request' || !startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run tests (Docker, linux/amd64)
+        # Runs `go test -v -count=1 ./...` inside the build container so tests
+        # execute against the same linux/amd64 + CGO/NVML toolchain as the
+        # binaries, not the runner host. Fails the job on any test failure.
+        run: make docker-test
+
+      - name: Build linux/amd64 binaries (Docker)
+        run: make docker-build
+
+      - name: Verify binary
+        run: |
+          file bin/gpu-metrics-exporter bin/gpu-metrics-receiver
+          bin/gpu-metrics-receiver -version || true
+
+      - name: Upload binaries artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ github.sha }}
+          path: bin/
+          if-no-files-found: error
+          retention-days: 14
+
+  # ── tag: build .deb packages with the version from the tag ──
+  debs:
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-22.04
+    env:
+      VERSION: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run tests (Docker, linux/amd64)
+        # Gate the release on tests passing first, in the same linux/amd64
+        # container used to build the .deb packages.
+        run: make docker-test
+
+      - name: Build .deb packages
+        # make deb runs docker-build (binaries get version via ldflags) then
+        # scripts/build-deb.sh, producing dist/<pkg>_<VERSION>_amd64.deb.
+        run: make deb VERSION="${VERSION}"
+
+      - name: Inspect packages
+        run: |
+          ls -la dist/
+          for deb in dist/*.deb; do
+            echo "::group::$deb"
+            dpkg-deb -I "$deb"
+            dpkg-deb -c "$deb"
+            echo "::endgroup::"
+          done
+
+      - name: Upload .deb artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: debs-${{ github.ref_name }}
+          path: dist/*.deb
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Attach packages to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${VERSION}" --title "${VERSION}" --generate-notes --verify-tag dist/*.deb \
+            || gh release upload "${VERSION}" dist/*.deb --clobber

@@ -1,0 +1,17 @@
+[Unit]
+Description=GPU metrics exporter service
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/local/bin/gpu-metrics-exporter -serverPort 9999 -tickPeriod 60
+Restart=always
+RestartSec=1min
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gpu-metrics-exporter
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,17 @@
+[Unit]
+Description=GPU metrics receiver service
+After=network-online.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/local/bin/gpu-metrics-receiver -listenPort 9999
+Restart=always
+RestartSec=1min
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=gpu-metrics-receiver
+
+[Install]
+WantedBy=multi-user.target

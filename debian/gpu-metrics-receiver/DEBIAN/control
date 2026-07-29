@@ -1,0 +1,9 @@
+Package: gpu-metrics-receiver
+Version: __VERSION__
+Architecture: amd64
+Maintainer: irqlevel@gmail.com
+Section: utils
+Priority: optional
+Description: GPU metrics receiver for MWS GPU VMs
+ Vsock server that accepts exporter connections, decodes GPU metrics, and hands
+ them to an injected consumer on the host.
