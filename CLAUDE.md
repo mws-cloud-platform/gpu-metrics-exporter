@@ -34,7 +34,7 @@ CI lives in `.github/workflows/build.yml` (GitHub Actions). On every branch push
 ## Architecture
 
 ### Two-goroutine pipeline in the exporter (`pkg/gpumetricsexporter`)
-`exporter.go` runs `queryMetricsLoop` (ticker-driven, every `TickPeriod` seconds, default 10) and `sendMetricsLoop` (separate goroutine, `wg`-tracked), connected by a buffered `metricsQueue` channel (cap 32). Decoupling query from send means a slow/blocked vsock send doesn't stall NVML collection. Stop is via two `stop*Chan` signaled from `StopOnSignal` (driven by SIGINT/SIGTERM in `main.go`). The query loop blocks on `metricsQueue <- m`; the send loop drains it.
+`exporter.go` runs `queryMetricsLoop` (ticker-driven, every `TickPeriod` seconds, default 10) and `sendMetricsLoop` (separate goroutine, `wg`-tracked), connected by a buffered `metricsQueue` channel (cap 32). Decoupling query from send means a slow/blocked vsock send doesn't stall NVML collection. Stop is via two `stop*Chan` signaled from context (driven by SIGINT/SIGTERM in `main.go`). The query loop blocks on `metricsQueue <- m`; the send loop drains it.
 
 ### Per-tick collection (`query_metrics.go`)
 `queryMetrics()` builds one `gpumetrics.GpuMetrics` per tick: reads instance ID from `/var/lib/cloud/data/instance-id` (cloud-init), increments an atomic `seqno`, then for each GPU index runs `collectGPUInfo` — a sequence of ~20 `collect*` methods each pulling one NVML facet and silently no-oping on non-`nvml.SUCCESS` (unsupported features don't fail the whole tick). Also shells out to `systemctl` (nvidia-fabricmanager health) and `dmesg` (XID/SXID errors within the last `TickPeriod+10` sec).
@@ -52,7 +52,7 @@ CI lives in `.github/workflows/build.yml` (GitHub Actions). On every branch push
 
 ## Conventions
 
-- Logging is uber zap, production config, RFC3339Nano timestamps, JSON to stdout, no caller/stacktrace. Each component tags logs with `zap.String("component", "gpu-metrics-exporter"|-receiver|-consumer)`.
+- Logging is uber zap, production config, RFC3339Nano timestamps, JSON to stderr, no caller/stacktrace. Each component tags logs with `zap.String("component", "gpu-metrics-exporter"|-receiver|-consumer)`.
 - Deployment is via `.deb` packages built by `scripts/build-deb.sh` from `debian/<pkg>/DEBIAN/` templates (`control` + `postinst`/`prerm`/`postrm`) plus the binary and systemd unit — `make deb` drives it. The systemd units use **port 9999** and **tickPeriod 60** for the exporter — note these differ from the CLI defaults (port 1234, tick 10) in `main.go`.
 - Module path: `go.mws.cloud/gpu-metrics-exporter`. Internal imports use the full `github.com/mws-cloud-platform/...` path.
 - The exported consumer interface is spelled `GpuMeticsConsumer` (missing the `r` in "Metrics") — this is intentional/legacy, not a typo to fix casually: it's a public API name and renaming it is a breaking change for out-of-tree consumers.

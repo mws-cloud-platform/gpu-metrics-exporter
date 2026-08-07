@@ -757,15 +757,15 @@ func (e *GpuMetricsExporter) checkFabricManager() (gpumetrics.NvFabricManagerSta
 }
 
 func (e *GpuMetricsExporter) getXIDErrors() ([]string, error) {
-	exitCode, output := e.runCommand("dmesg", "--since", fmt.Sprintf("%d sec ago", e.config.TickPeriod+10), "-l", "err")
+	secAgo := int((e.config.TickPeriod + 10*time.Second).Seconds())
+	exitCode, output := e.runCommand("dmesg", "--since", fmt.Sprintf("%d sec ago", secAgo), "-l", "err")
 	if exitCode != 0 {
 		err := fmt.Errorf("dmesg failed with code: %d", exitCode)
 		return nil, err
 	}
 
 	var errors []string
-	lines := strings.Split(output, "\n")
-	for _, line := range lines {
+	for line := range strings.SplitSeq(output, "\n") {
 		lowerLine := strings.ToLower(line)
 		if strings.Contains(lowerLine, "xid") || strings.Contains(lowerLine, "sxid") {
 			// do not send already sent dmesg lines

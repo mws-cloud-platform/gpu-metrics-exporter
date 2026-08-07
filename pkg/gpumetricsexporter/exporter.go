@@ -1,6 +1,7 @@
 package gpumetricsexporter
 
 import (
+	"context"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -11,12 +12,12 @@ import (
 )
 
 // GpuMetricsExporterConfig configures the exporter: the host vsock port to send
-// to, the collection interval in seconds, the build version stamped onto each
-// payload, and a logger.
+// to, the collection interval, the build version stamped onto each payload, and
+// a logger.
 type GpuMetricsExporterConfig struct {
 	ServerPort int
 	Log        *zap.Logger
-	TickPeriod int
+	TickPeriod time.Duration
 	Version    string
 }
 
@@ -26,8 +27,6 @@ type GpuMetricsExporterConfig struct {
 type GpuMetricsExporter struct {
 	log                   *zap.Logger
 	queryMetricsTicker    *time.Ticker
-	stopQueryMetricsChan  chan struct{}
-	stopSendMetricsChan   chan struct{}
 	wg                    sync.WaitGroup
 	metricsQueue          chan *gpumetrics.GpuMetrics
 	seqno                 atomic.Int64
@@ -53,45 +52,21 @@ func NewGpuMetricsExporter(config GpuMetricsExporterConfig) *GpuMetricsExporter 
 	// Set default tick period if not specified
 	tickPeriod := config.TickPeriod
 	if tickPeriod <= 0 {
-		tickPeriod = 10 // default to 10 seconds
+		tickPeriod = 10 * time.Second // default to 10 seconds
 	}
 
-	queryPeriod := time.Duration(tickPeriod) * time.Second
 	e := &GpuMetricsExporter{
-		queryMetricsTicker:   time.NewTicker(queryPeriod),
-		stopQueryMetricsChan: make(chan struct{}, 1),
-		stopSendMetricsChan:  make(chan struct{}, 1),
-		log:                  log,
-		metricsQueue:         make(chan *gpumetrics.GpuMetrics, metricsQueueCapacity),
-		config:               config,
+		queryMetricsTicker: time.NewTicker(tickPeriod),
+		log:                log,
+		metricsQueue:       make(chan *gpumetrics.GpuMetrics, metricsQueueCapacity),
+		config:             config,
 	}
 	// Initialize seqno to 0
 	e.seqno.Store(0)
 	return e
 }
 
-// StopOnSignal requests a graceful shutdown of both the query and send loops.
-// It is non-blocking and safe to call more than once (e.g. SIGINT then
-// SIGTERM): stop channels are buffered and signals are dropped if already
-// pending.
-func (e *GpuMetricsExporter) StopOnSignal() {
-	e.log.Info("stop on signal")
-
-	e.queryMetricsTicker.Stop()
-	// Non-blocking: a second signal (e.g. SIGINT then SIGTERM) would otherwise
-	// park here forever on a full buffered channel whose reader has already
-	// returned.
-	signalStop := func(ch chan<- struct{}) {
-		select {
-		case ch <- struct{}{}:
-		default:
-		}
-	}
-	signalStop(e.stopQueryMetricsChan)
-	signalStop(e.stopSendMetricsChan)
-}
-
-func (e *GpuMetricsExporter) queryMetricsLoop() {
+func (e *GpuMetricsExporter) queryMetricsLoop(ctx context.Context) {
 	e.log.Info("starting query metrics loop")
 
 	for {
@@ -107,18 +82,18 @@ func (e *GpuMetricsExporter) queryMetricsLoop() {
 			// interrupt us here instead of parking forever on metricsQueue <- m.
 			select {
 			case e.metricsQueue <- m:
-			case <-e.stopQueryMetricsChan:
+			case <-ctx.Done():
 				e.log.Info("received stop signal")
 				return
 			}
-		case <-e.stopQueryMetricsChan:
+		case <-ctx.Done():
 			e.log.Info("received stop signal")
 			return
 		}
 	}
 }
 
-func (e *GpuMetricsExporter) sendMetricsLoop() {
+func (e *GpuMetricsExporter) sendMetricsLoop(ctx context.Context) {
 	defer e.wg.Done()
 
 	e.log.Info("starting send metrics loop")
@@ -127,7 +102,7 @@ func (e *GpuMetricsExporter) sendMetricsLoop() {
 		select {
 		case m := <-e.metricsQueue:
 			e.sendMetrics(m)
-		case <-e.stopSendMetricsChan:
+		case <-ctx.Done():
 			e.log.Info("received stop signal")
 			return
 		}
@@ -135,10 +110,10 @@ func (e *GpuMetricsExporter) sendMetricsLoop() {
 }
 
 // Run starts the exporter: initializes NVML, launches the send goroutine, and
-// runs the query loop in the calling goroutine until StopOnSignal is invoked.
+// runs the query loop in the calling goroutine until the context is done.
 // It blocks until both loops have stopped and NVML has been shut down.
-func (e *GpuMetricsExporter) Run() error {
-	e.log.Info("run", zap.Int("ServerPort", e.config.ServerPort), zap.Int("TickPeriod", e.config.TickPeriod))
+func (e *GpuMetricsExporter) Run(ctx context.Context) error {
+	e.log.Info("run", zap.Int("ServerPort", e.config.ServerPort), zap.Duration("TickPeriod", e.config.TickPeriod))
 	e.startTime = time.Now().UTC().Unix()
 
 	err := e.initNVML()
@@ -153,9 +128,9 @@ func (e *GpuMetricsExporter) Run() error {
 	}()
 
 	e.wg.Add(1)
-	go e.sendMetricsLoop()
+	go e.sendMetricsLoop(ctx)
 
-	e.queryMetricsLoop()
+	e.queryMetricsLoop(ctx)
 
 	e.log.Info("wait wg")
 	e.wg.Wait()
