@@ -11,14 +11,6 @@ import (
 	"go.uber.org/zap"
 )
 
-// GpuMeticsConsumer is the interface implemented by downstream consumers of
-// decoded metrics. (The misspelling of "Metrics" is intentional/legacy: it is a
-// public API name and renaming it is a breaking change for out-of-tree
-// consumers.)
-type GpuMeticsConsumer interface {
-	OnGpuMetricsReceived(metrics *gpumetrics.GpuMetrics) error
-}
-
 // GpuMetricsReceiverConfig configures the receiver: the vsock port to listen
 // on, a logger, and the consumer that receives each decoded metrics payload.
 type GpuMetricsReceiverConfig struct {

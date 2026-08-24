@@ -1,31 +1,26 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
-	gpumetricsexporter "go.mws.cloud/gpu-metrics-exporter/pkg/gpumetricsexporter"
 	"go.uber.org/zap"
-	"go.uber.org/zap/zapcore"
+
+	"go.mws.cloud/gpu-metrics-exporter/internal/log"
+	"go.mws.cloud/gpu-metrics-exporter/pkg/gpumetricsexporter"
 )
 
-// version is the exporter build version, injected at build time via
-// -ldflags "-X main.version=…". It is surfaced via the -version flag and
-// stamped onto every emitted metrics payload.
 var version string
 
-// main is the gpu-metrics-exporter entry point: it parses flags, sets up
-// logging, wires SIGINT/SIGTERM to graceful shutdown, and runs the exporter
-// until stopped.
 func main() {
-	var serverPort int
-	var tickPeriod int
-
-	flag.IntVar(&serverPort, "serverPort", 1234, "server vsock port")
-	flag.IntVar(&tickPeriod, "tickPeriod", 10, "metrics gathering tick period")
+	port := flag.Int("serverPort", 1234, "server vsock port")
+	periodSecs := flag.Int("tickPeriod", 10, "metrics gathering period in seconds")
+	logLevel := zap.LevelFlag("logLevel", zap.InfoLevel, "log level (default info)")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
 
@@ -34,31 +29,27 @@ func main() {
 		os.Exit(0)
 	}
 
-	logCfg := zap.NewProductionConfig()
-	logCfg.OutputPaths = []string{"stdout"}
-	logCfg.EncoderConfig.CallerKey = ""
-	logCfg.EncoderConfig.EncodeTime = zapcore.RFC3339NanoTimeEncoder
-	logCfg.DisableStacktrace = true
-
-	log, err := logCfg.Build()
+	logger, err := log.NewLogger(*logLevel)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "logCfg.Build error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
-	defer log.Sync()
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-
-	e := gpumetricsexporter.NewGpuMetricsExporter(gpumetricsexporter.GpuMetricsExporterConfig{ServerPort: serverPort, Log: log, TickPeriod: tickPeriod, Version: version})
-	go func() {
-		<-sigCh
-		e.StopOnSignal()
-	}()
-
-	err = e.Run()
-	if err != nil {
-		log.Error("a.Run", zap.Error(err))
-		os.Exit(1)
+	if err := run(logger, *port, *periodSecs, version); err != nil {
+		logger.Fatal("Run", zap.Error(err))
 	}
+}
+
+func run(logger *zap.Logger, port int, periodSecs int, version string) error {
+	defer logger.Sync()
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	return gpumetricsexporter.NewGpuMetricsExporter(gpumetricsexporter.GpuMetricsExporterConfig{
+		ServerPort: port,
+		Log:        logger,
+		TickPeriod: time.Duration(periodSecs) * time.Second,
+		Version:    version,
+	}).Run(ctx)
 }

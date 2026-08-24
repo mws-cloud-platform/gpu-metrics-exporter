@@ -29,6 +29,7 @@ ENV PATH="/usr/local/go/bin:${PATH}"
 WORKDIR /src
 COPY go.mod ./
 COPY go.sum ./
+COPY internal/ internal/
 COPY pkg/ pkg/
 COPY cmd/ cmd/
 
@@ -42,4 +43,3 @@ RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
 FROM ubuntu:22.04
 COPY --from=builder /gpu-metrics-exporter /gpu-metrics-exporter
 COPY --from=builder /gpu-metrics-receiver /gpu-metrics-receiver
-
