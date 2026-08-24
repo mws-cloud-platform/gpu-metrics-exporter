@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"os"
 	"sync"
 	"time"
 
@@ -14,12 +15,22 @@ import (
 
 // VsockConn wraps a raw AF_VSOCK fd to implement net.Conn. Read/Write operate
 // directly on the fd via unix.Read/unix.Write; Close is guarded so it is safe
-// to call multiple times. VSOCK does not support real deadlines, so the
-// Set*Deadline methods are no-ops.
+// to call multiple times.
+//
+// AF_VSOCK does not support the {SOL_SOCKET, SO_RCVTIMEO/SO_SNDTIMEO} options
+// on all kernels the same way net.Conn deadlines are expressed (absolute
+// times), so SetReadDeadline is implemented by recomputing the remaining
+// interval and applying SO_RCVTIMEO per Read call: a stalled peer that stops
+// mid-frame surfaces as os.ErrDeadlineExceeded instead of blocking the serving
+// goroutine (and its fd) until process shutdown. SetWriteDeadline/SetDeadline
+// remain no-ops; the exporter always writes a full frame and the send path is
+// not exposed to untrusted peers.
 type VsockConn struct {
-	fd        int
-	closeErr  error
-	closeOnce sync.Once
+	fd           int
+	closeErr     error
+	closeOnce    sync.Once
+	mu           sync.Mutex
+	readDeadline time.Time
 }
 
 // NewVsockConn wraps an already-connected AF_VSOCK file descriptor.
@@ -30,8 +41,27 @@ func NewVsockConn(fd int) *VsockConn {
 // Read implements io.Reader over the raw fd. A raw read(2) reports end-of-stream
 // as (0, nil); to honour the io.Reader contract (which forbids (0, nil) for a
 // non-empty buffer and would otherwise make io.ReadFull/binary.Read spin
-// forever) it is translated to io.EOF.
+// forever) it is translated to io.EOF. When a read deadline is set, a timed-out
+// recv (EAGAIN/EWOULDBLOCK) is translated to os.ErrDeadlineExceeded.
 func (c *VsockConn) Read(b []byte) (int, error) {
+	c.mu.Lock()
+	deadline := c.readDeadline
+	c.mu.Unlock()
+
+	if !deadline.IsZero() {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return 0, os.ErrDeadlineExceeded
+		}
+		tv := unix.NsecToTimeval(remaining.Nanoseconds())
+		// SO_RCVTIMEO makes a blocking recv return EAGAIN after the interval;
+		// it is reapplied per Read so the absolute deadline is honoured across
+		// the multiple reads binary.Read/io.ReadFull issue for one frame.
+		if err := unix.SetsockoptTimeval(c.fd, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &tv); err != nil {
+			return 0, err
+		}
+	}
+
 	n, err := unix.Read(c.fd, b)
 	// A raw read(2) returns (0, nil) at end-of-stream, but the io.Reader
 	// contract forbids returning (0, nil) for a non-empty buffer: io.ReadFull
@@ -39,6 +69,11 @@ func (c *VsockConn) Read(b []byte) (int, error) {
 	// spin forever on it when a peer closes mid-frame. Translate EOF explicitly.
 	if n == 0 && err == nil && len(b) > 0 {
 		return 0, io.EOF
+	}
+	// A recv that hit SO_RCVTIMEO reports EAGAIN/EWOULDBLOCK; surface it as a
+	// deadline so the caller (RecvData/handleConnection) can drop the conn.
+	if err != nil && (err == unix.EAGAIN || err == unix.EWOULDBLOCK) && !deadline.IsZero() && n <= 0 {
+		return 0, os.ErrDeadlineExceeded
 	}
 	return n, err
 }
@@ -58,19 +93,25 @@ func (c *VsockConn) Close() error {
 	return c.closeErr
 }
 
-// SetDeadline is a no-op: AF_VSOCK does not support deadlines natively.
+// SetDeadline is a no-op: only read deadlines are enforced on AF_VSOCK (the
+// receiver is the side exposed to untrusted guests and the only side that can
+// stall on a read).
 func (c *VsockConn) SetDeadline(t time.Time) error {
-	// VSOCK doesn't support deadlines natively
-	// Could implement with goroutines + timers if needed
 	return nil
 }
 
-// SetReadDeadline is a no-op: AF_VSOCK does not support deadlines natively.
+// SetReadDeadline sets the absolute time after which a blocked Read returns
+// os.ErrDeadlineExceeded. It is enforced via SO_RCVTIMEO recomputed per Read, so
+// a peer that sends a header and then goes silent cannot pin a goroutine and fd
+// until the process exits.
 func (c *VsockConn) SetReadDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.readDeadline = t
+	c.mu.Unlock()
 	return nil
 }
 
-// SetWriteDeadline is a no-op: AF_VSOCK does not support deadlines natively.
+// SetWriteDeadline is a no-op (see SetDeadline).
 func (c *VsockConn) SetWriteDeadline(t time.Time) error {
 	return nil
 }

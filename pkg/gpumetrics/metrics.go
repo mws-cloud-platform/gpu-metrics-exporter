@@ -6,11 +6,11 @@ import (
 	"encoding/json"
 )
 
-// GpuMetricsSouce identifies where a metrics payload originated: the guest
+// GpuMetricsSource identifies where a metrics payload originated: the guest
 // VM's vsock CID (filled in by the receiver from the peer address) and its
 // cloud-init instance ID (read by the exporter). Downstream code is expected
 // to map VsockClientID -> VMID.
-type GpuMetricsSouce struct {
+type GpuMetricsSource struct {
 	VsockClientID uint32 `json:"vsock_client_id"`
 	InstanceID    string `json:"instance_id"`
 }
@@ -29,18 +29,18 @@ type GPUInfo struct {
 	Name                  string                `json:"name"`
 	Serial                string                `json:"serial"`
 	Temperature           uint                  `json:"temperature_celsius"`
-	MemoryTemp            uint                  `json:"memory_temperature_celsius"` // NEW
+	MemoryTemp            uint                  `json:"memory_temperature_celsius"`
 	PowerUsage            uint                  `json:"power_usage_watts"`
 	PowerLimit            uint                  `json:"power_limit_watts"`
 	MemoryTotal           uint64                `json:"memory_total_bytes"`
 	MemoryUsed            uint64                `json:"memory_used_bytes"`
 	MemoryFree            uint64                `json:"memory_free_bytes"`
-	BAR1MemoryTotal       uint64                `json:"bar1_memory_total_bytes"` // NEW
-	BAR1MemoryUsed        uint64                `json:"bar1_memory_used_bytes"`  // NEW
-	BAR1MemoryFree        uint64                `json:"bar1_memory_free_bytes"`  // NEW
+	BAR1MemoryTotal       uint64                `json:"bar1_memory_total_bytes"`
+	BAR1MemoryUsed        uint64                `json:"bar1_memory_used_bytes"`
+	BAR1MemoryFree        uint64                `json:"bar1_memory_free_bytes"`
 	Utilization           GPUUtilization        `json:"utilization"`
-	DecoderUtil           uint                  `json:"decoder_utilization_percent"` // NEW
-	EncoderUtil           uint                  `json:"encoder_utilization_percent"` // NEW
+	DecoderUtil           uint                  `json:"decoder_utilization_percent"`
+	EncoderUtil           uint                  `json:"encoder_utilization_percent"`
 	Clocks                GPUClocks             `json:"clocks"`
 	FanSpeed              uint                  `json:"fan_speed_percent"`
 	PCI                   PCIInfo               `json:"pci_info"`
@@ -53,10 +53,10 @@ type GPUInfo struct {
 	PerformanceStateValue int                   `json:"performance_state_value"`
 	ECC                   ECCInfo               `json:"ecc_info"`
 	RowRemapping          RowRemappingInfo      `json:"row_remapping_info"`
-	ClocksThrottle        ClocksThrottleInfo    `json:"clocks_throttle_info"`    // NEW
-	NvLink                NvLinkInfo            `json:"nvlink_info"`             // NEW
-	Architecture          string                `json:"architecture"`            // NEW
-	CUDAComputeCapability CUDAComputeCapability `json:"cuda_compute_capability"` // NEW
+	ClocksThrottle        ClocksThrottleInfo    `json:"clocks_throttle_info"`
+	NvLink                NvLinkInfo            `json:"nvlink_info"`
+	Architecture          string                `json:"architecture"`
+	CUDAComputeCapability CUDAComputeCapability `json:"cuda_compute_capability"`
 	PersistenceMode       int                   `json:"persistence_mode"`
 }
 
@@ -82,10 +82,10 @@ type PCIInfo struct {
 	Device       uint   `json:"device"`
 	PCIGen       uint   `json:"pci_generation"`
 	LinkWidth    uint   `json:"link_width_current"`
-	MaxPCIGen    uint   `json:"max_pci_generation"` // NEW
-	MaxLinkWidth uint   `json:"max_link_width"`     // NEW
-	TxThroughput uint32 `json:"tx_throughtput"`
-	RxThroughput uint32 `json:"rx_throughtput"`
+	MaxPCIGen    uint   `json:"max_pci_generation"`
+	MaxLinkWidth uint   `json:"max_link_width"`
+	TxThroughput uint32 `json:"tx_throughput"`
+	RxThroughput uint32 `json:"rx_throughput"`
 }
 
 // ECCInfo holds the GPU's ECC mode and error counters for DRAM/SRAM memory and
@@ -119,11 +119,11 @@ type ECCErrorsCounters struct {
 // RetiredPagesInfo holds counts of retired GPU memory pages due to ECC errors,
 // with per-tick deltas. SBE = single-bit, DBE = double-bit.
 type RetiredPagesInfo struct {
-	SBEPages          uint64 `json:"sbe_pages"` // NEW
-	DBEPages          uint64 `json:"dbe_pages"` // NEW
+	SBEPages          uint64 `json:"sbe_pages"`
+	DBEPages          uint64 `json:"dbe_pages"`
 	SBEPagesDelta     int64  `json:"sbe_pages_delta"`
 	DBEPagesDelta     int64  `json:"dbe_pages_delta"`
-	PendingPages      uint64 `json:"pending_pages"` // NEW
+	PendingPages      uint64 `json:"pending_pages"`
 	PendingPagesDelta int64  `json:"pending_pages_delta"`
 	Error             string `json:"error"`
 }
@@ -140,7 +140,8 @@ type RowRemappingInfo struct {
 	Error              string `json:"error"`
 }
 
-// NEW: Clocks throttle information
+// ClocksThrottleInfo holds the GPU's current clocks throttle and event reasons
+// (bitmasks) plus their human-readable forms.
 type ClocksThrottleInfo struct {
 	ThrottleReasons    uint64 `json:"throttle_reasons"`
 	ThrottleReasonsStr string `json:"throttle_reasons_string"`
@@ -148,7 +149,7 @@ type ClocksThrottleInfo struct {
 	EventReasonsStr    string `json:"event_reasons_string"`
 }
 
-// NEW: NVLink information
+// NvLinkInfo holds per-link NVLink state and error counters for a GPU.
 type NvLinkInfo struct {
 	Links []NvLinkState `json:"links"`
 }
@@ -197,7 +198,7 @@ type XIDErrors struct {
 // the host receiver: provenance, exporter health, fabric-manager status, XID
 // errors, and one GPUInfo entry per detected GPU.
 type GpuMetrics struct {
-	Source                GpuMetricsSouce       `json:"source"`
+	Source                GpuMetricsSource      `json:"source"`
 	ExporterInfo          ExporterInfo          `json:"exporter_info"`
 	NvFabricManagerStatus NvFabricManagerStatus `json:"nv_fabric_manager_status"`
 	XIDErrors             XIDErrors             `json:"xid_errors"`

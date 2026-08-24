@@ -141,6 +141,16 @@ func (e *GpuMetricsExporter) queryMetrics() (*gpumetrics.GpuMetrics, error) {
 		metrics.XIDErrors.XIDErrors = xidErrors
 	}
 
+	// Publish this snapshot as the delta baseline for the next tick. Computing
+	// deltas against the last *collected* snapshot (not the last *sent* one)
+	// keeps *_Delta fields additive even when several payloads backlog in
+	// metricsQueue while a send is stalled: each tick diffs against the
+	// immediately-previous snapshot, so summing the deltas of backlogged
+	// payloads still reconstructs the true cumulative increase.
+	e.lastMetricsMu.Lock()
+	e.lastMetrics = metrics
+	e.lastMetricsMu.Unlock()
+
 	return metrics, nil
 }
 
@@ -158,23 +168,23 @@ func (e *GpuMetricsExporter) collectGPUInfo(index int) gpumetrics.GPUInfo {
 	e.collectTemperature(device, &gpuInfo)
 	e.collectPowerInfo(device, &gpuInfo)
 	e.collectMemoryInfo(device, &gpuInfo)
-	e.collectBAR1MemoryInfo(device, &gpuInfo) // NEW
+	e.collectBAR1MemoryInfo(device, &gpuInfo)
 	e.collectUtilization(device, &gpuInfo)
-	e.collectDecoderEncoderUtil(device, &gpuInfo) // NEW
+	e.collectDecoderEncoderUtil(device, &gpuInfo)
 	e.collectClockSpeeds(device, &gpuInfo)
 	e.collectFanSpeed(device, &gpuInfo)
 	e.collectPCIInfo(device, &gpuInfo)
 	e.collectDriverInfo(&gpuInfo)
 	e.collectVBiosInfo(device, &gpuInfo)
-	e.collectArchitecture(device, &gpuInfo) // NEW
-	e.collectCUDACores(device, &gpuInfo)    // NEW
+	e.collectArchitecture(device, &gpuInfo)
+	e.collectCUDACores(device, &gpuInfo)
 	e.collectComputeMode(device, &gpuInfo)
 	e.collectPerformanceState(device, &gpuInfo)
 	e.collectPersistenceMode(device, &gpuInfo)
-	e.collectClocksThrottleInfo(device, &gpuInfo) // NEW
+	e.collectClocksThrottleInfo(device, &gpuInfo)
 	e.collectECCInfo(device, gpuInfo.UUID, &gpuInfo)
 	e.collectRowRemappingInfo(device, gpuInfo.UUID, &gpuInfo)
-	e.collectNvLinkInfo(device, gpuInfo.UUID, &gpuInfo) // NEW
+	e.collectNvLinkInfo(device, gpuInfo.UUID, &gpuInfo)
 
 	return gpuInfo
 }
@@ -200,18 +210,17 @@ func (e *GpuMetricsExporter) collectTemperature(device nvml.Device, info *gpumet
 		info.Temperature = uint(temp)
 	}
 
-	// Get memory temperature using field values
+	// Get memory temperature using field values. GetFieldValues returns SUCCESS
+	// for the batch even when an individual field is unsupported, so each
+	// field's own NvmlReturn must be checked before reading its Value (an
+	// unsupported field leaves the [8]byte Value zeroed/garbage).
 	fieldValues := []nvml.FieldValue{
 		{FieldId: nvml.FI_DEV_MEMORY_TEMP},
 	}
 
 	if ret := device.GetFieldValues(fieldValues); ret == nvml.SUCCESS {
-		if len(fieldValues) > 0 {
-			// Memory temperature is typically stored as uint32 in the byte array
-			info.MemoryTemp = uint(fieldValues[0].Value[0]) |
-				uint(fieldValues[0].Value[1])<<8 |
-				uint(fieldValues[0].Value[2])<<16 |
-				uint(fieldValues[0].Value[3])<<24
+		if fv := &fieldValues[0]; nvml.Return(fv.NvmlReturn) == nvml.SUCCESS {
+			info.MemoryTemp = uint(binary.LittleEndian.Uint32(fv.Value[:]))
 		}
 	}
 }
@@ -236,7 +245,7 @@ func (e *GpuMetricsExporter) collectMemoryInfo(device nvml.Device, info *gpumetr
 	}
 }
 
-// NEW: collectBAR1MemoryInfo collects BAR1 memory information
+// collectBAR1MemoryInfo collects BAR1 memory information
 func (e *GpuMetricsExporter) collectBAR1MemoryInfo(device nvml.Device, info *gpumetrics.GPUInfo) {
 	if bar1MemInfo, ret := device.GetBAR1MemoryInfo(); ret == nvml.SUCCESS {
 		info.BAR1MemoryTotal = bar1MemInfo.Bar1Total
@@ -255,7 +264,7 @@ func (e *GpuMetricsExporter) collectUtilization(device nvml.Device, info *gpumet
 	}
 }
 
-// NEW: collectDecoderEncoderUtil collects decoder and encoder utilization
+// collectDecoderEncoderUtil collects decoder and encoder utilization
 func (e *GpuMetricsExporter) collectDecoderEncoderUtil(device nvml.Device, info *gpumetrics.GPUInfo) {
 	if decoderUtil, _, ret := device.GetDecoderUtilization(); ret == nvml.SUCCESS {
 		info.DecoderUtil = uint(decoderUtil)
@@ -374,7 +383,7 @@ func (e *GpuMetricsExporter) collectPersistenceMode(device nvml.Device, info *gp
 	}
 }
 
-// NEW: collectArchitecture collects GPU architecture information
+// collectArchitecture collects GPU architecture information
 func (e *GpuMetricsExporter) collectArchitecture(device nvml.Device, info *gpumetrics.GPUInfo) {
 	if arch, ret := device.GetArchitecture(); ret == nvml.SUCCESS {
 		switch arch {
@@ -411,7 +420,7 @@ func (e *GpuMetricsExporter) collectCUDACores(device nvml.Device, info *gpumetri
 	}
 }
 
-// NEW: collectClocksThrottleInfo collects clocks throttle reasons
+// collectClocksThrottleInfo collects clocks throttle reasons
 func (e *GpuMetricsExporter) collectClocksThrottleInfo(device nvml.Device, info *gpumetrics.GPUInfo) {
 	if reasons, ret := device.GetCurrentClocksThrottleReasons(); ret == nvml.SUCCESS {
 		info.ClocksThrottle.ThrottleReasons = reasons
@@ -437,7 +446,7 @@ func (e *GpuMetricsExporter) collectECCInfo(device nvml.Device, gpuID string, in
 	if currentMode == 1 {
 		info.ECC.Mode = "Enabled"
 		e.collectECCErrors(device, gpuID, &info.ECC)
-		e.collectRetiredPages(device, gpuID, &info.ECC) // NEW
+		e.collectRetiredPages(device, gpuID, &info.ECC)
 	} else {
 		info.ECC.Mode = "Disabled"
 	}
@@ -464,20 +473,33 @@ func (e *GpuMetricsExporter) collectRetiredPages(device nvml.Device, gpuID strin
 	}
 
 	if ret := device.GetFieldValues(fieldValues); ret == nvml.SUCCESS {
-		if len(fieldValues) >= 3 {
-			// Assuming little-endian byte order (common for x86)
-			eccInfo.RetiredPages.SBEPages = binary.LittleEndian.Uint64(fieldValues[0].Value[:])
-			eccInfo.RetiredPages.DBEPages = binary.LittleEndian.Uint64(fieldValues[1].Value[:])
-			eccInfo.RetiredPages.PendingPages = binary.LittleEndian.Uint64(fieldValues[2].Value[:])
+		// GetFieldValues returns SUCCESS for the batch even when individual
+		// fields are unsupported; read each field's Value only when its own
+		// NvmlReturn is SUCCESS, otherwise the [8]byte is uninitialised and
+		// would feed garbage into the delta logic below.
+		got := 0
+		if fv := &fieldValues[0]; nvml.Return(fv.NvmlReturn) == nvml.SUCCESS {
+			eccInfo.RetiredPages.SBEPages = binary.LittleEndian.Uint64(fv.Value[:])
+			got++
+		}
+		if fv := &fieldValues[1]; nvml.Return(fv.NvmlReturn) == nvml.SUCCESS {
+			eccInfo.RetiredPages.DBEPages = binary.LittleEndian.Uint64(fv.Value[:])
+			got++
+		}
+		if fv := &fieldValues[2]; nvml.Return(fv.NvmlReturn) == nvml.SUCCESS {
+			eccInfo.RetiredPages.PendingPages = binary.LittleEndian.Uint64(fv.Value[:])
+			got++
+		}
 
+		if got == 0 {
+			eccInfo.RetiredPages.Error = "no retired-pages fields supported by NVML"
+		} else {
 			lastGpuInfo := e.findLastGpuInfo(gpuID)
 			if lastGpuInfo != nil {
 				eccInfo.RetiredPages.SBEPagesDelta = getValueDelta(eccInfo.RetiredPages.SBEPages, lastGpuInfo.ECC.RetiredPages.SBEPages)
 				eccInfo.RetiredPages.DBEPagesDelta = getValueDelta(eccInfo.RetiredPages.DBEPages, lastGpuInfo.ECC.RetiredPages.DBEPages)
 				eccInfo.RetiredPages.PendingPagesDelta = getValueDelta(eccInfo.RetiredPages.PendingPages, lastGpuInfo.ECC.RetiredPages.PendingPages)
 			}
-		} else {
-			eccInfo.RetiredPages.Error = fmt.Sprintf("len(fieldValues): %d != 3", len(fieldValues))
 		}
 	} else {
 		eccInfo.RetiredPages.Error = fmt.Sprintf("GetFieldValues error: %s", nvml.ErrorString(ret))
@@ -724,7 +746,7 @@ func parseEventReasons(events uint64) string {
 }
 
 func (e *GpuMetricsExporter) runCommand(name string, args ...string) (int, string) {
-	e.log.Info("run", zap.String("name", name), zap.Strings("args", args))
+	e.log.Debug("run", zap.String("name", name), zap.Strings("args", args))
 	cmd := exec.Command(name, args...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
@@ -737,7 +759,7 @@ func (e *GpuMetricsExporter) runCommand(name string, args ...string) (int, strin
 		e.log.Error("run", zap.String("name", name), zap.Strings("args", args), zap.Error(err), zap.String("output", string(output)))
 		return -1, string(output)
 	}
-	e.log.Info("run", zap.String("name", name), zap.Strings("args", args), zap.String("output", string(output)))
+	e.log.Debug("run", zap.String("name", name), zap.Strings("args", args), zap.String("output", string(output)))
 	return 0, string(output)
 }
 
@@ -764,21 +786,40 @@ func (e *GpuMetricsExporter) getXIDErrors() ([]string, error) {
 		return nil, err
 	}
 
-	var errors []string
+	// Pull candidate XID/SXID lines out of dmesg without holding the lock: the
+	// dmesg shell-out can take a while and must not block the send goroutine,
+	// which needs lastMetricsMu to record send outcomes.
+	var candidates []string
 	for line := range strings.SplitSeq(output, "\n") {
 		lowerLine := strings.ToLower(line)
 		if strings.Contains(lowerLine, "xid") || strings.Contains(lowerLine, "sxid") {
-			// do not send already sent dmesg lines
-			e.lastMetricsMu.RLock()
-			if e.lastMetrics != nil && slices.Contains(e.lastMetrics.XIDErrors.XIDErrors, line) {
-				e.lastMetricsMu.RUnlock()
-				continue
-			}
-			e.lastMetricsMu.RUnlock()
-
-			errors = append(errors, line)
+			candidates = append(candidates, line)
 		}
 	}
 
-	return errors, nil
+	e.lastMetricsMu.Lock()
+	defer e.lastMetricsMu.Unlock()
+
+	// Buffer any fresh line: skip lines already delivered (sent) or already
+	// queued (unsent). Buffering happens regardless of the dmesg window, so a
+	// line observed once is re-shipped on every following payload until its
+	// carrying payload is confirmed sent — surviving both transient send
+	// failures and dmesg-window expiry.
+	for _, line := range candidates {
+		if _, sent := e.sentXIDErrors[line]; sent {
+			continue
+		}
+		if slices.Contains(e.unsentXIDErrors, line) {
+			continue
+		}
+		e.unsentXIDErrors = append(e.unsentXIDErrors, line)
+	}
+
+	if len(e.unsentXIDErrors) == 0 {
+		return nil, nil
+	}
+	// Return the full pending set; sendMetrics drains it on success.
+	result := make([]string, len(e.unsentXIDErrors))
+	copy(result, e.unsentXIDErrors)
+	return result, nil
 }

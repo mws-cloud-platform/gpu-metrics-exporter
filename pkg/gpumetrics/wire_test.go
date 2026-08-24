@@ -10,7 +10,7 @@ import (
 // regression in any json tag surfaces as a diff.
 func sampleGpuMetrics() *GpuMetrics {
 	m := NewGpuMetrics()
-	m.Source = GpuMetricsSouce{VsockClientID: 42, InstanceID: "i-abc123"}
+	m.Source = GpuMetricsSource{VsockClientID: 42, InstanceID: "i-abc123"}
 	m.ExporterInfo = ExporterInfo{
 		Seqno: 7, Timestamp: 1700000000, Version: "2026.06.08-2", StartTime: 1699999000,
 		InitNVMLError: "", GetDeviceCountError: "", ReadInstanceIDError: "",

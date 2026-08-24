@@ -24,6 +24,6 @@ func NewGpuMetricsLogConsumer(log *zap.Logger) *GpuMetricsLogConsumer {
 }
 
 func (c *GpuMetricsLogConsumer) OnGpuMetricsReceived(metrics *gpumetrics.GpuMetrics) error {
-	c.log.Info("metrics", zap.Any("metrics", metrics))
+	c.log.Debug("metrics", zap.Any("metrics", metrics))
 	return nil
 }

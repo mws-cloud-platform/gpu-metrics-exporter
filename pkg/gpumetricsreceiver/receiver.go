@@ -2,8 +2,11 @@ package gpumetricsreceiver
 
 import (
 	"context"
+	"errors"
+	"os"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"go.mws.cloud/gpu-metrics-exporter/pkg/gpumetrics"
 	"go.mws.cloud/gpu-metrics-exporter/pkg/vsock/common"
@@ -12,34 +15,80 @@ import (
 )
 
 // GpuMetricsReceiverConfig configures the receiver: the vsock port to listen
-// on, a logger, and the consumer that receives each decoded metrics payload.
+// on, a logger, the consumer that receives each decoded metrics payload, and
+// resource limits bounding untrusted guest connections.
+//
+// MaxConnections bounds the total number of simultaneously-served guest
+// connections; 0 applies no bound (production sets a sane default via
+// NewGpuMetricsReceiver). MaxConnectionsPerCID bounds concurrent connections
+// per guest VM (by peer CID); 0 applies no bound. ReadTimeout bounds how long a
+// single framed read may block before the connection is dropped, so a guest
+// that opens a connection and then stalls cannot pin a goroutine and fd; 0
+// disables the deadline.
 type GpuMetricsReceiverConfig struct {
-	ListenPort      int
-	Log             *zap.Logger
-	MetricsConsumer GpuMeticsConsumer
+	ListenPort           int
+	Log                  *zap.Logger
+	MetricsConsumer      GpuMeticsConsumer
+	MaxConnections       int
+	MaxConnectionsPerCID int
+	ReadTimeout          time.Duration
 }
 
 // GpuMetricsReceiver accepts exporter connections over vsock, decodes each
 // framed GpuMetrics payload, and hands it to the configured consumer. Shutdown
 // is coordinated through context cancellation plus Close.
 type GpuMetricsReceiver struct {
-	config          GpuMetricsReceiverConfig
-	log             *zap.Logger
-	metricsConsumer GpuMeticsConsumer
-	stopping        atomic.Int32
-	wg              sync.WaitGroup
-	listener        *server.VsockListener
-	connections     map[*common.VsockConn]struct{}
-	connectionsMu   sync.Mutex
+	config               GpuMetricsReceiverConfig
+	log                  *zap.Logger
+	metricsConsumer      GpuMeticsConsumer
+	stopping             atomic.Int32
+	wg                   sync.WaitGroup
+	listener             *server.VsockListener
+	connections          map[*common.VsockConn]struct{}
+	cidCounts            map[uint32]int
+	connectionsMu        sync.Mutex
+	maxConnections       int
+	maxConnectionsPerCID int
+	readTimeout          time.Duration
 }
 
-// NewGpuMetricsReceiver constructs a receiver from config.
+// NewGpuMetricsReceiver constructs a receiver from config. Zero-valued
+// resource limits are replaced with defaults so a misconfigured receiver still
+// bounds untrusted guest connections.
 func NewGpuMetricsReceiver(config GpuMetricsReceiverConfig) *GpuMetricsReceiver {
 	log := config.Log.With(zap.String("component", "gpu-metrics-receiver"))
-	r := &GpuMetricsReceiver{log: log, config: config, metricsConsumer: config.MetricsConsumer, connections: make(map[*common.VsockConn]struct{})}
+	if config.MaxConnections == 0 {
+		config.MaxConnections = defaultMaxConnections
+	}
+	if config.MaxConnectionsPerCID == 0 {
+		config.MaxConnectionsPerCID = defaultMaxConnectionsPerCID
+	}
+	if config.ReadTimeout == 0 {
+		config.ReadTimeout = defaultReadTimeout
+	}
+	r := &GpuMetricsReceiver{
+		log:                  log,
+		config:               config,
+		metricsConsumer:      config.MetricsConsumer,
+		connections:          make(map[*common.VsockConn]struct{}),
+		cidCounts:            make(map[uint32]int),
+		maxConnections:       config.MaxConnections,
+		maxConnectionsPerCID: config.MaxConnectionsPerCID,
+		readTimeout:          config.ReadTimeout,
+	}
 	r.stopping.Store(0)
 	return r
 }
+
+// Resource-limit defaults applied by NewGpuMetricsReceiver when the config
+// leaves them at zero. They are conservative: one VM should not need dozens of
+// simultaneous exporter connections, and a frame must arrive well within a
+// minute.
+const (
+	defaultMaxConnections       = 64
+	defaultMaxConnectionsPerCID = 4
+	defaultReadTimeout          = 60 * time.Second
+)
 
 func (r *GpuMetricsReceiver) shutdown() {
 	if !r.stopping.CompareAndSwap(0, 1) {
@@ -103,8 +152,8 @@ func (r *GpuMetricsReceiver) setListener(l *server.VsockListener) {
 
 // handleConnection serves one exporter connection: reads framed GpuMetrics
 // payloads in a loop, dispatching each via processFrame, until the exporter
-// sends its close-frame (ErrNoData), the connection breaks, or the receiver is
-// stopping.
+// sends its close-frame (ErrNoData), the connection breaks, a read times out,
+// or the receiver is stopping.
 func (r *GpuMetricsReceiver) handleConnection(conn *common.VsockConn) {
 	defer r.wg.Done()
 	defer func() {
@@ -112,6 +161,16 @@ func (r *GpuMetricsReceiver) handleConnection(conn *common.VsockConn) {
 		_, ok := r.connections[conn]
 		if ok {
 			delete(r.connections, conn)
+		}
+		if ok && r.cidCounts != nil && conn.RemoteAddr().CID != 0 {
+			// The peer CID is the VM identity; decrement its concurrent count.
+			cid := conn.RemoteAddr().CID
+			if r.cidCounts[cid] > 0 {
+				r.cidCounts[cid]--
+				if r.cidCounts[cid] == 0 {
+					delete(r.cidCounts, cid)
+				}
+			}
 		}
 		r.connectionsMu.Unlock()
 
@@ -128,10 +187,21 @@ func (r *GpuMetricsReceiver) handleConnection(conn *common.VsockConn) {
 	r.log.Info("exporter connected", zap.Any("remote", conn.RemoteAddr()))
 
 	for r.stopping.Load() == 0 {
+		// Reset the per-frame read deadline so a guest that stalls mid-stream
+		// (or after sending just a header) is dropped instead of pinning this
+		// goroutine and its fd until process shutdown.
+		if r.readTimeout > 0 {
+			conn.SetReadDeadline(time.Now().Add(r.readTimeout))
+		}
+
 		data, err := conn.RecvData()
 		if err != nil {
 			// other side want stop
 			if err == common.ErrNoData {
+				break
+			}
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				r.log.Warn("read timeout, closing connection", zap.Any("remote", conn.RemoteAddr()))
 				break
 			}
 
@@ -167,7 +237,7 @@ func (r *GpuMetricsReceiver) processFrame(cid uint32, data []byte) bool {
 		r.log.Error("gpumetrics.NewGpuMetricsFromBytes", zap.Error(err))
 		return false
 	}
-	r.log.Info("received metrics", zap.Any("metrics", metrics))
+	r.log.Debug("received metrics", zap.Any("metrics", metrics))
 	metrics.Source.VsockClientID = cid
 	if err := r.metricsConsumer.OnGpuMetricsReceived(metrics); err != nil {
 		r.log.Error("metrics consumer", zap.Error(err))
@@ -176,6 +246,8 @@ func (r *GpuMetricsReceiver) processFrame(cid uint32, data []byte) bool {
 }
 
 func (r *GpuMetricsReceiver) serveConnection(conn *common.VsockConn) {
+	cid := conn.RemoteAddr().CID
+
 	r.connectionsMu.Lock()
 	if r.stopping.Load() != 0 {
 		r.connectionsMu.Unlock()
@@ -183,7 +255,29 @@ func (r *GpuMetricsReceiver) serveConnection(conn *common.VsockConn) {
 		conn.Close()
 		return
 	}
+	// Bound untrusted guest connections: a misbehaving VM must not be able to
+	// exhaust host fds/goroutines by opening many connections (overall cap) or
+	// flooding from a single CID (per-CID cap). 0 means no cap.
+	if r.maxConnections > 0 && len(r.connections) >= r.maxConnections {
+		r.connectionsMu.Unlock()
+		r.log.Warn("max connections reached, rejecting connection",
+			zap.Int("current", len(r.connections)), zap.Int("max", r.maxConnections),
+			zap.Uint32("clientID", cid))
+		conn.Close()
+		return
+	}
+	if r.maxConnectionsPerCID > 0 && r.cidCounts != nil && r.cidCounts[cid] >= r.maxConnectionsPerCID {
+		r.connectionsMu.Unlock()
+		r.log.Warn("max per-CID connections reached, rejecting connection",
+			zap.Uint32("clientID", cid), zap.Int("current", r.cidCounts[cid]),
+			zap.Int("max", r.maxConnectionsPerCID))
+		conn.Close()
+		return
+	}
 	r.connections[conn] = struct{}{}
+	if r.cidCounts != nil {
+		r.cidCounts[cid]++
+	}
 	r.connectionsMu.Unlock()
 
 	r.wg.Add(1)

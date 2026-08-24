@@ -38,6 +38,15 @@ type GpuMetricsExporter struct {
 	sendMetricsLastError  string
 	lastMetricsMu         sync.RWMutex
 	lastMetrics           *gpumetrics.GpuMetrics
+	// XID/SXID error-line tracking. unsentXIDErrors holds lines that have been
+	// observed in dmesg but whose carrying payload has not yet been confirmed
+	// delivered: they ride along on every subsequent payload until a send
+	// succeeds, so a transient send failure (or a send stall lasting longer
+	// than the dmesg look-back window) cannot silently drop an XID. sentXIDErrors
+	// remembers lines already delivered so the overlapping dmesg window does not
+	// re-ship them as duplicates. Both are guarded by lastMetricsMu.
+	unsentXIDErrors []string
+	sentXIDErrors   map[string]struct{}
 }
 
 const (
@@ -113,6 +122,8 @@ func (e *GpuMetricsExporter) sendMetricsLoop(ctx context.Context) {
 // runs the query loop in the calling goroutine until the context is done.
 // It blocks until both loops have stopped and NVML has been shut down.
 func (e *GpuMetricsExporter) Run(ctx context.Context) error {
+	defer e.queryMetricsTicker.Stop()
+
 	e.log.Info("run", zap.Int("ServerPort", e.config.ServerPort), zap.Duration("TickPeriod", e.config.TickPeriod))
 	e.startTime = time.Now().UTC().Unix()
 
