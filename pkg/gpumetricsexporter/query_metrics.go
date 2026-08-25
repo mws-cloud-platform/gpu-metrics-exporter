@@ -188,6 +188,7 @@ func (e *GpuMetricsExporter) collectGPUInfo(index int) gpumetrics.GPUInfo {
 	e.collectECCInfo(device, gpuInfo.UUID, &gpuInfo)
 	e.collectRowRemappingInfo(device, gpuInfo.UUID, &gpuInfo)
 	e.collectNvLinkInfo(device, gpuInfo.UUID, &gpuInfo)
+	e.collectMIGInfo(device, &gpuInfo)
 
 	return gpuInfo
 }
@@ -917,4 +918,99 @@ func (e *GpuMetricsExporter) xidErrorsDroppedCount() int64 {
 	e.lastMetricsMu.RLock()
 	defer e.lastMetricsMu.RUnlock()
 	return e.xidErrorsDropped
+}
+
+// collectMIGInfo collects the GPU's Multi-Instance GPU state and, when MIG is
+// active, one entry per instantiated MIG device.
+//
+// GetMigMode answering NOT_SUPPORTED is the normal case on non-MIG hardware, so
+// it leaves Supported false rather than recording an error — only a genuine
+// failure on a MIG-capable card is worth surfacing. Everything else follows the
+// house rule: an unsupported sub-query no-ops and leaves its field zero-valued
+// instead of failing the tick.
+func (e *GpuMetricsExporter) collectMIGInfo(device nvml.Device, info *gpumetrics.GPUInfo) {
+	currentMode, pendingMode, ret := device.GetMigMode()
+	if ret == nvml.ERROR_NOT_SUPPORTED {
+		// Not a MIG-capable GPU. Supported stays false; this is not an error.
+		return
+	}
+	if ret != nvml.SUCCESS {
+		info.MIG.Error = fmt.Sprintf("GetMigMode error: %s", nvml.ErrorString(ret))
+		return
+	}
+
+	info.MIG.Supported = true
+	info.MIG.Enabled = currentMode == nvml.DEVICE_MIG_ENABLE
+	info.MIG.PendingEnabled = pendingMode == nvml.DEVICE_MIG_ENABLE
+	// A pending mode that differs from the current one means the partitioning
+	// an operator configured is not the one running: it takes effect only after
+	// a GPU reset (or once every client releases the device).
+	info.MIG.PendingChange = currentMode != pendingMode
+
+	if !info.MIG.Enabled {
+		// With MIG off there are no instances to walk, and the handle queries
+		// below would fail on every index.
+		return
+	}
+
+	maxCount, ret := device.GetMaxMigDeviceCount()
+	if ret != nvml.SUCCESS {
+		info.MIG.Error = fmt.Sprintf("GetMaxMigDeviceCount error: %s", nvml.ErrorString(ret))
+		return
+	}
+
+	for i := 0; i < maxCount; i++ {
+		migDevice, ret := device.GetMigDeviceHandleByIndex(i)
+		if ret == nvml.ERROR_NOT_FOUND {
+			// Sparse by design: indices below maxCount need not be populated,
+			// because a partitioning leaves gaps (e.g. two 3g.40gb instances on
+			// a 7-slice A100). An empty slot is not an error.
+			continue
+		}
+		if ret != nvml.SUCCESS {
+			info.MIG.Instances = append(info.MIG.Instances, gpumetrics.MIGInstance{
+				Index: i,
+				Error: fmt.Sprintf("GetMigDeviceHandleByIndex error: %s", nvml.ErrorString(ret)),
+			})
+			continue
+		}
+
+		info.MIG.Instances = append(info.MIG.Instances, e.collectMIGInstance(migDevice, i))
+	}
+
+	info.MIG.InstanceCount = len(info.MIG.Instances)
+}
+
+// collectMIGInstance reads one MIG device handle. A MIG handle answers only a
+// subset of the device API, so each query is guarded individually and a failure
+// leaves that field zero-valued rather than dropping the whole instance.
+func (e *GpuMetricsExporter) collectMIGInstance(migDevice nvml.Device, index int) gpumetrics.MIGInstance {
+	instance := gpumetrics.MIGInstance{Index: index}
+
+	if uuid, ret := migDevice.GetUUID(); ret == nvml.SUCCESS {
+		instance.UUID = uuid
+	}
+	if name, ret := migDevice.GetName(); ret == nvml.SUCCESS {
+		instance.Name = name
+	}
+	if gpuInstanceID, ret := migDevice.GetGpuInstanceId(); ret == nvml.SUCCESS {
+		instance.GpuInstanceID = gpuInstanceID
+	}
+	if computeInstanceID, ret := migDevice.GetComputeInstanceId(); ret == nvml.SUCCESS {
+		instance.ComputeInstanceID = computeInstanceID
+	}
+	if memInfo, ret := migDevice.GetMemoryInfo(); ret == nvml.SUCCESS {
+		instance.MemoryTotal = memInfo.Total
+		instance.MemoryUsed = memInfo.Used
+		instance.MemoryFree = memInfo.Free
+	}
+	// Attributes carry the partition's size: how many slices of the parent GPU
+	// this instance owns, and how many SMs that works out to.
+	if attrs, ret := migDevice.GetAttributes(); ret == nvml.SUCCESS {
+		instance.MultiprocessorCount = uint(attrs.MultiprocessorCount)
+		instance.GpuInstanceSliceCount = uint(attrs.GpuInstanceSliceCount)
+		instance.ComputeInstanceSliceCount = uint(attrs.ComputeInstanceSliceCount)
+	}
+
+	return instance
 }

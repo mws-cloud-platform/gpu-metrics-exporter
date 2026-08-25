@@ -208,6 +208,37 @@ zero when the device handle cannot be opened.
 | `performance_state` | Performance state label (`P0`…`P15`) |
 | `performance_state_value` | Numeric performance state |
 | `persistence_mode` | Persistence mode (0/1) |
+
+**MIG (Multi-Instance GPU)**
+
+| Field | Description |
+| --- | --- |
+| `mig_info.supported` | NVML reports MIG as available on this GPU (false on pre-Ampere cards) |
+| `mig_info.enabled` | MIG mode currently in force |
+| `mig_info.pending_enabled` | MIG mode NVML will apply after the next GPU reset |
+| `mig_info.pending_change` | `enabled` and `pending_enabled` disagree — the configured partitioning is not the running one, and a GPU reset is required |
+| `mig_info.instance_count` | Number of instantiated MIG devices |
+| `mig_info.instances[]` | One entry per MIG device (see below) |
+| `mig_info.error` | Error message if the MIG query itself failed |
+
+Each `mig_info.instances[]` entry:
+
+| Field | Description |
+| --- | --- |
+| `index` | NVML MIG device index on the parent GPU. Sparse: a partitioning leaves gaps, so indices are not consecutive |
+| `uuid` | MIG device UUID (`MIG-…`) |
+| `name` | Instance product name, e.g. `NVIDIA A100-SXM4-40GB MIG 3g.20gb` |
+| `gpu_instance_id` / `compute_instance_id` | Identifiers NVML and `nvidia-smi` use to name the partition |
+| `memory_total_bytes` / `memory_used_bytes` / `memory_free_bytes` | Memory scoped to this instance |
+| `multiprocessor_count` | SMs assigned to the instance |
+| `gpu_instance_slice_count` / `compute_instance_slice_count` | Partition size in the card's slice units (e.g. 3 of 7) |
+| `error` | Error message if this specific instance could not be read |
+
+> Note: when MIG is enabled, NVML answers many whole-device queries with
+> `NOT_SUPPORTED` — utilization, per-device volatile ECC counters, clocks. Those
+> fields are then reported as `0`, following the same best-effort rule as any
+> unsupported feature. Check `mig_info.enabled` before reading a zero as a
+> genuinely idle GPU.
 | `cuda_compute_capability.major` / `.minor` | CUDA compute capability |
 
 **ECC (`ecc_info`)** — populated when ECC is enabled.

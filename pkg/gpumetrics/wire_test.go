@@ -35,6 +35,16 @@ func sampleGpuMetrics() *GpuMetrics {
 				PCIGen: 5, LinkWidth: 16, MaxPCIGen: 5, MaxLinkWidth: 16,
 				TxThroughput: 1234, RxThroughput: 4321,
 			},
+			MIG: MIGInfo{
+				Supported: true, Enabled: true, PendingEnabled: true, PendingChange: false,
+				InstanceCount: 1,
+				Instances: []MIGInstance{{
+					Index: 0, UUID: "MIG-aaaa", Name: "NVIDIA H100 MIG 3g.40gb",
+					GpuInstanceID: 1, ComputeInstanceID: 0,
+					MemoryTotal: 40 * 1024 * 1024 * 1024, MemoryUsed: 512, MemoryFree: 256,
+					MultiprocessorCount: 60, GpuInstanceSliceCount: 3, ComputeInstanceSliceCount: 3,
+				}},
+			},
 			DriverModel:           "WDDM",
 			DriverVersion:         "535.129.03",
 			VBios:                 "96.00.7F.00.01",

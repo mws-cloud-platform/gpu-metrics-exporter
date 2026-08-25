@@ -58,6 +58,53 @@ type GPUInfo struct {
 	Architecture          string                `json:"architecture"`
 	CUDAComputeCapability CUDAComputeCapability `json:"cuda_compute_capability"`
 	PersistenceMode       int                   `json:"persistence_mode"`
+	MIG                   MIGInfo               `json:"mig_info"`
+}
+
+// MIGInfo describes a GPU's Multi-Instance GPU partitioning.
+//
+// Supported is false on GPUs where NVML reports MIG as unsupported at all
+// (anything pre-Ampere, and Ampere+ cards whose driver refuses the query); the
+// remaining fields are meaningless then. Enabled reflects the mode in force
+// now, PendingEnabled the mode NVML will apply once the GPU is reset or all
+// clients release it, and PendingChange is the actionable difference: the two
+// disagree, so the partitioning an operator asked for is not the one running.
+//
+// Reading Enabled matters beyond MIG itself: with MIG on, NVML answers many
+// whole-device queries — utilization, per-device ECC volatile counters, clocks
+// — with NOT_SUPPORTED. The collectors treat that as "leave zero-valued", so a
+// MIG-enabled GPU reports zeros that a consumer would otherwise read as a genuinely
+// idle card. mig_info.enabled is how to tell those two apart.
+type MIGInfo struct {
+	Supported      bool          `json:"supported"`
+	Enabled        bool          `json:"enabled"`
+	PendingEnabled bool          `json:"pending_enabled"`
+	PendingChange  bool          `json:"pending_change"`
+	InstanceCount  int           `json:"instance_count"`
+	Instances      []MIGInstance `json:"instances"`
+	Error          string        `json:"error"`
+}
+
+// MIGInstance is one instantiated MIG device: a compute instance within a GPU
+// instance, which NVML addresses through its own device handle.
+//
+// GpuInstanceID and ComputeInstanceID are the identifiers NVML and nvidia-smi
+// use to name the partition, and together with the parent GPU's UUID they
+// identify it across ticks. SliceCount fields give the partition's size in the
+// card's slice units (e.g. 3 of 7 on an A100 3g.40gb).
+type MIGInstance struct {
+	Index                     int    `json:"index"`
+	UUID                      string `json:"uuid"`
+	Name                      string `json:"name"`
+	GpuInstanceID             int    `json:"gpu_instance_id"`
+	ComputeInstanceID         int    `json:"compute_instance_id"`
+	MemoryTotal               uint64 `json:"memory_total_bytes"`
+	MemoryUsed                uint64 `json:"memory_used_bytes"`
+	MemoryFree                uint64 `json:"memory_free_bytes"`
+	MultiprocessorCount       uint   `json:"multiprocessor_count"`
+	GpuInstanceSliceCount     uint   `json:"gpu_instance_slice_count"`
+	ComputeInstanceSliceCount uint   `json:"compute_instance_slice_count"`
+	Error                     string `json:"error"`
 }
 
 // GPUUtilization holds current GPU and memory utilization as percentages.
