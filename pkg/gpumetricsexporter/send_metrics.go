@@ -55,14 +55,14 @@ func (e *GpuMetricsExporter) sendMetrics(m *gpumetrics.GpuMetrics) error {
 	defer e.lastMetricsMu.Unlock()
 
 	if len(m.XIDErrors.XIDErrors) > 0 {
-		if e.sentXIDErrors == nil {
-			e.sentXIDErrors = make(map[string]time.Time, len(m.XIDErrors.XIDErrors))
+		if e.retiredXIDErrors == nil {
+			e.retiredXIDErrors = make(map[string]time.Time, len(m.XIDErrors.XIDErrors))
 		}
-		// Stamp the delivery time so pruneSentXIDErrors can retire the record
+		// Stamp the delivery time so pruneRetiredXIDErrors can drop the record
 		// once the line can no longer reappear in the dmesg look-back window.
 		now := time.Now()
 		for _, line := range m.XIDErrors.XIDErrors {
-			e.sentXIDErrors[line] = now
+			e.retiredXIDErrors[line] = now
 		}
 		e.unsentXIDErrors = removeStrings(e.unsentXIDErrors, m.XIDErrors.XIDErrors)
 	}

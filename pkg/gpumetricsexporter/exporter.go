@@ -43,13 +43,16 @@ type GpuMetricsExporter struct {
 	// delivered: they ride along on every subsequent payload until a send
 	// succeeds, so a transient send failure (or a send stall lasting longer
 	// than the dmesg look-back window) cannot silently drop an XID.
-	// sentXIDErrors maps an already-delivered line to when it was delivered, so
-	// the overlapping dmesg window does not re-ship it as a duplicate; records
-	// are pruned once they age out of that window. xidErrorsDropped counts
-	// lines evicted from unsentXIDErrors on overflow and is reported on the
+	// retiredXIDErrors maps a line that has left the pending buffer — whether
+	// delivered or dropped on overflow — to when it left, so the overlapping
+	// dmesg window cannot re-admit it; records are pruned once they age out of
+	// that window. Dropped lines belong in here too: a line that is neither
+	// pending nor retired looks fresh on the next tick and gets re-queued
+	// behind newer lines, which then get evicted in its place.
+	// xidErrorsDropped counts lines evicted on overflow and is reported on the
 	// wire as XIDErrors.DroppedCount. All three are guarded by lastMetricsMu.
 	unsentXIDErrors  []string
-	sentXIDErrors    map[string]time.Time
+	retiredXIDErrors map[string]time.Time
 	xidErrorsDropped int64
 }
 
@@ -65,10 +68,10 @@ const (
 	// the current fault) and the loss is counted, never silent.
 	maxUnsentXIDErrors = 128
 
-	// maxSentXIDErrors backstops the delivered-line set for the case where a
+	// maxRetiredXIDErrors backstops the retired-line set for the case where a
 	// single dmesg window carries more distinct lines than age-based pruning
 	// retires.
-	maxSentXIDErrors = 1024
+	maxRetiredXIDErrors = 1024
 
 	// xidDmesgWindowSlack is added to TickPeriod to form the dmesg look-back
 	// window, so consecutive ticks overlap and no line falls between them.

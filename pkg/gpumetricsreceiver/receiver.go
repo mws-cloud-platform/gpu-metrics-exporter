@@ -19,12 +19,15 @@ import (
 // resource limits bounding untrusted guest connections.
 //
 // MaxConnections bounds the total number of simultaneously-served guest
-// connections; 0 applies no bound (production sets a sane default via
-// NewGpuMetricsReceiver). MaxConnectionsPerCID bounds concurrent connections
-// per guest VM (by peer CID); 0 applies no bound. ReadTimeout bounds how long a
-// single framed read may block before the connection is dropped, so a guest
-// that opens a connection and then stalls cannot pin a goroutine and fd; 0
-// disables the deadline.
+// connections. MaxConnectionsPerCID bounds concurrent connections per guest VM
+// (by peer CID). ReadTimeout bounds how long a single framed read may block
+// before the connection is dropped, so a guest that opens a connection and then
+// stalls cannot pin a goroutine and fd.
+//
+// For all three, a zero value means "use the default" — NewGpuMetricsReceiver
+// substitutes one, so an under-specified config is still bounded against
+// untrusted guests. Pass a negative value to disable a limit outright; that is
+// the only way to opt out, and it should be a deliberate choice.
 type GpuMetricsReceiverConfig struct {
 	ListenPort           int
 	Log                  *zap.Logger
@@ -54,7 +57,8 @@ type GpuMetricsReceiver struct {
 
 // NewGpuMetricsReceiver constructs a receiver from config. Zero-valued
 // resource limits are replaced with defaults so a misconfigured receiver still
-// bounds untrusted guest connections.
+// bounds untrusted guest connections; negative values are left alone and read
+// as "no limit" at the enforcement sites, which all test for > 0.
 func NewGpuMetricsReceiver(config GpuMetricsReceiverConfig) *GpuMetricsReceiver {
 	log := config.Log.With(zap.String("component", "gpu-metrics-receiver"))
 	if config.MaxConnections == 0 {
@@ -108,6 +112,14 @@ func (r *GpuMetricsReceiver) shutdown() {
 		connections = append(connections, conn)
 		delete(r.connections, conn)
 	}
+	// Clear the per-CID counts alongside the connection set. handleConnection's
+	// teardown only decrements when it still finds the conn in r.connections,
+	// so draining that map above means those decrements never happen. Run()
+	// resets `stopping` and rebuilds the listener, i.e. the receiver is meant
+	// to be re-runnable; leaving stale counts here would have every CID that
+	// was live at shutdown start the next Run already partway to its per-CID
+	// cap — or over it, and rejected outright.
+	clear(r.cidCounts)
 	r.connectionsMu.Unlock()
 
 	for _, conn := range connections {
@@ -156,16 +168,27 @@ func (r *GpuMetricsReceiver) setListener(l *server.VsockListener) {
 // or the receiver is stopping.
 func (r *GpuMetricsReceiver) handleConnection(conn *common.VsockConn) {
 	defer r.wg.Done()
+
+	// Resolve the peer CID once, before the teardown defer closes over it: it's
+	// the VM identity check (CID >= 3), the value stamped onto
+	// metrics.Source.VsockClientID for downstream CID→VMID mapping, and the key
+	// the connection is counted under. Reading it once keeps that identity
+	// stable instead of re-querying the kernel per frame and again at teardown,
+	// where getpeername can fail and yield a different (zero) answer.
+	cid := conn.RemoteAddr().CID
+
 	defer func() {
 		r.connectionsMu.Lock()
 		_, ok := r.connections[conn]
 		if ok {
 			delete(r.connections, conn)
-		}
-		if ok && r.cidCounts != nil && conn.RemoteAddr().CID != 0 {
-			// The peer CID is the VM identity; decrement its concurrent count.
-			cid := conn.RemoteAddr().CID
-			if r.cidCounts[cid] > 0 {
+			// Release the per-CID slot under the same key serveConnection
+			// counted it under. That increment is unconditional, so this
+			// decrement must be too: gating it on a re-read of the peer CID
+			// would skip the release exactly when the read fails, and the VM
+			// would lose a slot permanently. shutdown() clears the whole map
+			// for the case where it drained r.connections first.
+			if r.cidCounts != nil && r.cidCounts[cid] > 0 {
 				r.cidCounts[cid]--
 				if r.cidCounts[cid] == 0 {
 					delete(r.cidCounts, cid)
@@ -178,12 +201,6 @@ func (r *GpuMetricsReceiver) handleConnection(conn *common.VsockConn) {
 			conn.Close()
 		}
 	}()
-
-	// Resolve the peer CID once: it's both the VM identity check (CID >= 3) and
-	// the value stamped onto metrics.Source.VsockClientID for downstream CID→VMID
-	// mapping. Reading it once per connection also keeps a stable identity across
-	// the loop instead of re-querying the kernel each frame.
-	cid := conn.RemoteAddr().CID
 	r.log.Info("exporter connected", zap.Any("remote", conn.RemoteAddr()))
 
 	for r.stopping.Load() == 0 {

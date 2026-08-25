@@ -804,19 +804,19 @@ func (e *GpuMetricsExporter) getXIDErrors() ([]string, error) {
 	e.lastMetricsMu.Lock()
 	defer e.lastMetricsMu.Unlock()
 
-	// Retire delivered-line records that can no longer collide with the dmesg
-	// window. This is what keeps sentXIDErrors bounded over the process
-	// lifetime: dmesg lines carry timestamps, so no two are ever equal and an
-	// unpruned set would grow forever.
-	e.pruneSentXIDErrors(time.Now(), 2*window)
+	// Retire records that can no longer collide with the dmesg window. This is
+	// what keeps retiredXIDErrors bounded over the process lifetime: dmesg
+	// lines carry timestamps, so no two are ever equal and an unpruned set
+	// would grow forever.
+	e.pruneRetiredXIDErrors(time.Now(), 2*window)
 
-	// Buffer any fresh line: skip lines already delivered (sent) or already
-	// queued (unsent). Buffering happens regardless of the dmesg window, so a
-	// line observed once is re-shipped on every following payload until its
-	// carrying payload is confirmed sent — surviving both transient send
-	// failures and dmesg-window expiry.
+	// Buffer any fresh line: skip lines already retired (delivered, or dropped
+	// on overflow) and lines already queued. Buffering happens regardless of
+	// the dmesg window, so a line observed once is re-shipped on every
+	// following payload until its carrying payload is confirmed sent —
+	// surviving both transient send failures and dmesg-window expiry.
 	for _, line := range candidates {
-		if _, sent := e.sentXIDErrors[line]; sent {
+		if _, retired := e.retiredXIDErrors[line]; retired {
 			continue
 		}
 		if slices.Contains(e.unsentXIDErrors, line) {
@@ -854,6 +854,21 @@ func (e *GpuMetricsExporter) trimUnsentXIDErrors() {
 	dropped := e.unsentXIDErrors[:overflow]
 	e.unsentXIDErrors = append([]string(nil), e.unsentXIDErrors[overflow:]...)
 	e.xidErrorsDropped += int64(overflow)
+
+	// Retire the evicted lines so the next tick cannot re-admit them. Without
+	// this they are neither retired nor pending, so a line still inside the
+	// overlapping dmesg window looks fresh, gets appended to the *tail*, and
+	// the following trim evicts from the head — which by then holds lines
+	// *newer* than the ones just re-admitted. That inverts the oldest-first
+	// rule above and re-counts the same physical line into xidErrorsDropped on
+	// every tick it thrashes, making DroppedCount overstate the real loss.
+	if e.retiredXIDErrors == nil {
+		e.retiredXIDErrors = make(map[string]time.Time, overflow)
+	}
+	now := time.Now()
+	for _, line := range dropped {
+		e.retiredXIDErrors[line] = now
+	}
 	e.log.Warn("XID buffer full, dropped oldest lines",
 		zap.Int("dropped", overflow),
 		zap.Int("max", maxUnsentXIDErrors),
@@ -861,37 +876,38 @@ func (e *GpuMetricsExporter) trimUnsentXIDErrors() {
 		zap.Strings("droppedLines", dropped))
 }
 
-// pruneSentXIDErrors drops delivered-line records older than retention, then
-// trims what remains to the maxSentXIDErrors most recent as a backstop against
+// pruneRetiredXIDErrors drops retired-line records older than retention, then
+// trims what remains to the maxRetiredXIDErrors most recent as a backstop against
 // a dmesg window carrying more distinct lines than age alone retires.
 //
-// Evicting a record whose line is still inside the dmesg look-back window would
-// re-ship that line once. Callers pass a retention of twice the window, so
-// age-based pruning never does this; only the size backstop can, and it trips
-// solely during an XID storm where a duplicate is the lesser problem.
+// Evicting a record whose line is still inside the dmesg look-back window lets
+// that line be re-admitted to the pending buffer. Callers pass a retention of
+// twice the window, so age-based pruning never does this; only the size
+// backstop can, and it trips solely during an XID storm where a re-admission is
+// the lesser problem.
 //
 // Callers must hold lastMetricsMu.
-func (e *GpuMetricsExporter) pruneSentXIDErrors(now time.Time, retention time.Duration) {
-	for line, sentAt := range e.sentXIDErrors {
-		if now.Sub(sentAt) > retention {
-			delete(e.sentXIDErrors, line)
+func (e *GpuMetricsExporter) pruneRetiredXIDErrors(now time.Time, retention time.Duration) {
+	for line, retiredAt := range e.retiredXIDErrors {
+		if now.Sub(retiredAt) > retention {
+			delete(e.retiredXIDErrors, line)
 		}
 	}
 
-	if len(e.sentXIDErrors) <= maxSentXIDErrors {
+	if len(e.retiredXIDErrors) <= maxRetiredXIDErrors {
 		return
 	}
 
-	lines := make([]string, 0, len(e.sentXIDErrors))
-	for line := range e.sentXIDErrors {
+	lines := make([]string, 0, len(e.retiredXIDErrors))
+	for line := range e.retiredXIDErrors {
 		lines = append(lines, line)
 	}
 	// Newest first, so everything past the cap is the oldest.
 	slices.SortFunc(lines, func(a, b string) int {
-		return e.sentXIDErrors[b].Compare(e.sentXIDErrors[a])
+		return e.retiredXIDErrors[b].Compare(e.retiredXIDErrors[a])
 	})
-	for _, line := range lines[maxSentXIDErrors:] {
-		delete(e.sentXIDErrors, line)
+	for _, line := range lines[maxRetiredXIDErrors:] {
+		delete(e.retiredXIDErrors, line)
 	}
 }
 
