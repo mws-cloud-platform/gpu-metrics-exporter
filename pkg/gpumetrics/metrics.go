@@ -189,9 +189,15 @@ type NvFabricManagerStatus struct {
 }
 
 // XIDErrors holds recent XID/SXID error lines collected from the kernel log.
+// A line is re-shipped on every payload until one carrying it is confirmed
+// delivered, so a transient send failure cannot lose an error. DroppedCount is
+// the cumulative number of lines the exporter had to discard because that
+// pending buffer overflowed — non-zero means XID errors were lost, and the
+// kernel log on the guest is the only remaining record of them.
 type XIDErrors struct {
-	Error     string   `json:"error"`
-	XIDErrors []string `json:"xid_errors"`
+	Error        string   `json:"error"`
+	XIDErrors    []string `json:"xid_errors"`
+	DroppedCount int64    `json:"dropped_count"`
 }
 
 // GpuMetrics is the top-level payload exchanged between the guest exporter and

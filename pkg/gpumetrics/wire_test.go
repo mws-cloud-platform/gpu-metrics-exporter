@@ -17,7 +17,7 @@ func sampleGpuMetrics() *GpuMetrics {
 		SendMetricsErrorCount: 3, SendMetricsLastError: "boom",
 	}
 	m.NvFabricManagerStatus = NvFabricManagerStatus{Active: true, Enabled: true, NotDegraded: true}
-	m.XIDErrors = XIDErrors{XIDErrors: []string{"Xid 79 on GPU 0", "SXid 13"}}
+	m.XIDErrors = XIDErrors{XIDErrors: []string{"Xid 79 on GPU 0", "SXid 13"}, DroppedCount: 4}
 	m.GpuDeviceCount = 2
 	m.Gpus = []GPUInfo{
 		{

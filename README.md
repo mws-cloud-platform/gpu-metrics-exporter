@@ -45,15 +45,38 @@ Source code location: `cmd/gpu-metrics-receiver` and `pkg/gpumetricsreceiver`.
 The GPU metrics collector should convert CID into VMID, for example by parsing
 and searching in running qemu command lines.
 
+Guests are less trusted than the host, so the receiver bounds what one can
+consume. `GpuMetricsReceiverConfig` exposes three limits, each defaulted when
+left at zero:
+
+| Field | Default | Purpose |
+| --- | --- | --- |
+| `MaxConnections` | 64 | Total simultaneous guest connections |
+| `MaxConnectionsPerCID` | 4 | Simultaneous connections from one VM |
+| `ReadTimeout` | 60 s | Per-frame read deadline |
+
+Connections over a limit are closed immediately. The read deadline is what stops
+a guest from opening a connection, sending a frame header, and going silent to
+pin a goroutine and an fd until the process exits.
+
 ## Exported metrics
 
 On every tick (default 10 s; the deployed systemd unit uses 60 s) the exporter
 collects one `GpuMetrics` payload and ships it to the host. The wire format is
 JSON → gzip, framed over vsock (see `pkg/gpumetrics`). Field names below are the
-JSON keys as they appear on the wire. Cumulative counters carry a `*_delta`
-field giving the change since the previous tick (a counter reset/reboot yields
-0). Every per-GPU field is collected on a best-effort basis: unsupported
-features silently no-op and are left zero-valued rather than failing the tick.
+JSON keys as they appear on the wire. Every per-GPU field is collected on a
+best-effort basis: unsupported features silently no-op and are left zero-valued
+rather than failing the tick.
+
+Cumulative counters carry a `*_delta` field giving the change since the previous
+tick (a counter reset/reboot yields 0). The baseline is the previous *collected*
+snapshot, not the previous delivered one, which makes deltas additive: summing
+`*_delta` across a run of payloads reconstructs the true increase even when
+several backlog behind a slow send. The trade-off is that a payload which fails
+to send takes its delta with it — that increase is not folded into the next
+payload. Consumers that must not miss an increase should track the absolute
+counter (`sbe_pages`, `correctable`, …), which every payload carries in full;
+`*_delta` is a convenience for the common case.
 
 ### Payload envelope
 
@@ -92,12 +115,22 @@ fabrics such as H100), queried via `systemctl`.
 ### XID / SXid errors (`xid_errors`)
 
 Recent GPU error lines from the kernel log (`dmesg` within `tickPeriod + 10 s`),
-filtered for `xid`/`sxid`. Already-reported lines are deduped against the
-previous tick so each error is sent only once.
+filtered for `xid`/`sxid`.
+
+A line is buffered as soon as it is observed and re-shipped on every payload
+until a payload carrying it is confirmed delivered, so neither a transient send
+failure nor a send stall longer than the look-back window can lose an error.
+Once delivered, a line is remembered long enough that the overlapping window
+cannot re-ship it as a duplicate. The pending buffer is capped; if it overflows
+(only reachable when the host has been unreachable for a long time) the oldest
+lines are discarded and counted in `dropped_count`, because an unbounded buffer
+would eventually push the frame past the 64 KiB vsock limit and stop delivery
+altogether.
 
 | Field | Description |
 | --- | --- |
-| `xid_errors` | List of matching `dmesg` lines |
+| `xid_errors` | List of matching `dmesg` lines pending or newly delivered |
+| `dropped_count` | Cumulative lines discarded on buffer overflow; non-zero means XID errors were lost and only the guest's kernel log still has them |
 | `error` | Error message if the `dmesg` invocation failed |
 
 ### Per-GPU metrics (`gpu_info[]`)
@@ -163,11 +196,8 @@ zero when the device handle cannot be opened.
 | `pci_info.link_width_current` | Current PCIe link width |
 | `pci_info.max_pci_generation` | Maximum supported PCIe generation |
 | `pci_info.max_link_width` | Maximum supported link width |
-| `pci_info.tx_throughtput` | PCIe TX throughput (kB/s; can be 0 when idle) |
-| `pci_info.rx_throughtput` | PCIe RX throughput (kB/s; can be 0 when idle) |
-
-> Note: the `tx_throughtput` / `rx_throughtput` keys are spelled as in the wire
-> format (a pre-existing typo); consumers must use these exact names.
+| `pci_info.tx_throughput` | PCIe TX throughput (kB/s; can be 0 when idle) |
+| `pci_info.rx_throughput` | PCIe RX throughput (kB/s; can be 0 when idle) |
 
 **Compute mode & performance state**
 

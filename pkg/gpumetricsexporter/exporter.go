@@ -42,15 +42,37 @@ type GpuMetricsExporter struct {
 	// observed in dmesg but whose carrying payload has not yet been confirmed
 	// delivered: they ride along on every subsequent payload until a send
 	// succeeds, so a transient send failure (or a send stall lasting longer
-	// than the dmesg look-back window) cannot silently drop an XID. sentXIDErrors
-	// remembers lines already delivered so the overlapping dmesg window does not
-	// re-ship them as duplicates. Both are guarded by lastMetricsMu.
-	unsentXIDErrors []string
-	sentXIDErrors   map[string]struct{}
+	// than the dmesg look-back window) cannot silently drop an XID.
+	// sentXIDErrors maps an already-delivered line to when it was delivered, so
+	// the overlapping dmesg window does not re-ship it as a duplicate; records
+	// are pruned once they age out of that window. xidErrorsDropped counts
+	// lines evicted from unsentXIDErrors on overflow and is reported on the
+	// wire as XIDErrors.DroppedCount. All three are guarded by lastMetricsMu.
+	unsentXIDErrors  []string
+	sentXIDErrors    map[string]time.Time
+	xidErrorsDropped int64
 }
 
 const (
 	metricsQueueCapacity = 32
+
+	// maxUnsentXIDErrors bounds the XID/SXID re-ship buffer. The buffer must be
+	// bounded: while the host receiver is unreachable, every XID line observed
+	// accumulates and the whole set rides on every payload, growing it until
+	// the gzipped frame passes the 64 KiB vsock limit — at which point SendData
+	// fails on size for good and the exporter never recovers, even once the
+	// host returns. On overflow the oldest lines go first (the newest describe
+	// the current fault) and the loss is counted, never silent.
+	maxUnsentXIDErrors = 128
+
+	// maxSentXIDErrors backstops the delivered-line set for the case where a
+	// single dmesg window carries more distinct lines than age-based pruning
+	// retires.
+	maxSentXIDErrors = 1024
+
+	// xidDmesgWindowSlack is added to TickPeriod to form the dmesg look-back
+	// window, so consecutive ticks overlap and no line falls between them.
+	xidDmesgWindowSlack = 10 * time.Second
 )
 
 // NewGpuMetricsExporter constructs an exporter from config. A non-positive

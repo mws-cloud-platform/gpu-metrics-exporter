@@ -28,7 +28,7 @@ import (
 type GpuMetricsReceiverConfig struct {
 	ListenPort           int
 	Log                  *zap.Logger
-	MetricsConsumer      GpuMeticsConsumer
+	MetricsConsumer      GpuMetricsConsumer
 	MaxConnections       int
 	MaxConnectionsPerCID int
 	ReadTimeout          time.Duration
@@ -40,7 +40,7 @@ type GpuMetricsReceiverConfig struct {
 type GpuMetricsReceiver struct {
 	config               GpuMetricsReceiverConfig
 	log                  *zap.Logger
-	metricsConsumer      GpuMeticsConsumer
+	metricsConsumer      GpuMetricsConsumer
 	stopping             atomic.Int32
 	wg                   sync.WaitGroup
 	listener             *server.VsockListener

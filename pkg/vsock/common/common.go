@@ -17,20 +17,25 @@ import (
 // directly on the fd via unix.Read/unix.Write; Close is guarded so it is safe
 // to call multiple times.
 //
-// AF_VSOCK does not support the {SOL_SOCKET, SO_RCVTIMEO/SO_SNDTIMEO} options
-// on all kernels the same way net.Conn deadlines are expressed (absolute
-// times), so SetReadDeadline is implemented by recomputing the remaining
-// interval and applying SO_RCVTIMEO per Read call: a stalled peer that stops
-// mid-frame surfaces as os.ErrDeadlineExceeded instead of blocking the serving
-// goroutine (and its fd) until process shutdown. SetWriteDeadline/SetDeadline
-// remain no-ops; the exporter always writes a full frame and the send path is
-// not exposed to untrusted peers.
+// A net.Conn deadline is an absolute time, while the socket option that can
+// enforce one (SO_RCVTIMEO) is a relative interval, so SetReadDeadline is
+// implemented by recomputing the remaining time and re-applying SO_RCVTIMEO on
+// every Read: a stalled peer that stops mid-frame surfaces as
+// os.ErrDeadlineExceeded instead of blocking the serving goroutine (and its fd)
+// until process shutdown. SetWriteDeadline/SetDeadline remain no-ops; the
+// exporter always writes a full frame and the send path is not exposed to
+// untrusted peers.
 type VsockConn struct {
 	fd           int
 	closeErr     error
 	closeOnce    sync.Once
 	mu           sync.Mutex
 	readDeadline time.Time
+	// rcvTimeoutSet records whether SO_RCVTIMEO is currently armed on the fd,
+	// so clearing the deadline can disarm it. Without this, a socket that once
+	// had a deadline keeps timing out after the deadline is cleared, and the
+	// resulting EAGAIN surfaces as a raw errno instead of a clean blocking read.
+	rcvTimeoutSet bool
 }
 
 // NewVsockConn wraps an already-connected AF_VSOCK file descriptor.
@@ -46,9 +51,11 @@ func NewVsockConn(fd int) *VsockConn {
 func (c *VsockConn) Read(b []byte) (int, error) {
 	c.mu.Lock()
 	deadline := c.readDeadline
+	armed := c.rcvTimeoutSet
 	c.mu.Unlock()
 
-	if !deadline.IsZero() {
+	switch {
+	case !deadline.IsZero():
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
 			return 0, os.ErrDeadlineExceeded
@@ -60,6 +67,22 @@ func (c *VsockConn) Read(b []byte) (int, error) {
 		if err := unix.SetsockoptTimeval(c.fd, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &tv); err != nil {
 			return 0, err
 		}
+		c.mu.Lock()
+		c.rcvTimeoutSet = true
+		c.mu.Unlock()
+
+	case armed:
+		// The deadline was cleared but SO_RCVTIMEO is still armed from an
+		// earlier Read. Disarm it (zero means "block indefinitely"), otherwise
+		// reads keep timing out and, with no deadline set, the EAGAIN escapes
+		// to the caller as a raw errno.
+		tv := unix.NsecToTimeval(0)
+		if err := unix.SetsockoptTimeval(c.fd, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &tv); err != nil {
+			return 0, err
+		}
+		c.mu.Lock()
+		c.rcvTimeoutSet = false
+		c.mu.Unlock()
 	}
 
 	n, err := unix.Read(c.fd, b)
@@ -103,7 +126,8 @@ func (c *VsockConn) SetDeadline(t time.Time) error {
 // SetReadDeadline sets the absolute time after which a blocked Read returns
 // os.ErrDeadlineExceeded. It is enforced via SO_RCVTIMEO recomputed per Read, so
 // a peer that sends a header and then goes silent cannot pin a goroutine and fd
-// until the process exits.
+// until the process exits. A zero t clears the deadline; the next Read disarms
+// SO_RCVTIMEO and blocks indefinitely again.
 func (c *VsockConn) SetReadDeadline(t time.Time) error {
 	c.mu.Lock()
 	c.readDeadline = t

@@ -140,6 +140,9 @@ func (e *GpuMetricsExporter) queryMetrics() (*gpumetrics.GpuMetrics, error) {
 	} else {
 		metrics.XIDErrors.XIDErrors = xidErrors
 	}
+	// Cumulative, and reported even on a tick where dmesg itself failed: a
+	// non-zero count means XID lines were lost and must not go unnoticed.
+	metrics.XIDErrors.DroppedCount = e.xidErrorsDroppedCount()
 
 	// Publish this snapshot as the delta baseline for the next tick. Computing
 	// deltas against the last *collected* snapshot (not the last *sent* one)
@@ -779,7 +782,8 @@ func (e *GpuMetricsExporter) checkFabricManager() (gpumetrics.NvFabricManagerSta
 }
 
 func (e *GpuMetricsExporter) getXIDErrors() ([]string, error) {
-	secAgo := int((e.config.TickPeriod + 10*time.Second).Seconds())
+	window := e.config.TickPeriod + xidDmesgWindowSlack
+	secAgo := int(window.Seconds())
 	exitCode, output := e.runCommand("dmesg", "--since", fmt.Sprintf("%d sec ago", secAgo), "-l", "err")
 	if exitCode != 0 {
 		err := fmt.Errorf("dmesg failed with code: %d", exitCode)
@@ -800,6 +804,12 @@ func (e *GpuMetricsExporter) getXIDErrors() ([]string, error) {
 	e.lastMetricsMu.Lock()
 	defer e.lastMetricsMu.Unlock()
 
+	// Retire delivered-line records that can no longer collide with the dmesg
+	// window. This is what keeps sentXIDErrors bounded over the process
+	// lifetime: dmesg lines carry timestamps, so no two are ever equal and an
+	// unpruned set would grow forever.
+	e.pruneSentXIDErrors(time.Now(), 2*window)
+
 	// Buffer any fresh line: skip lines already delivered (sent) or already
 	// queued (unsent). Buffering happens regardless of the dmesg window, so a
 	// line observed once is re-shipped on every following payload until its
@@ -815,6 +825,8 @@ func (e *GpuMetricsExporter) getXIDErrors() ([]string, error) {
 		e.unsentXIDErrors = append(e.unsentXIDErrors, line)
 	}
 
+	e.trimUnsentXIDErrors()
+
 	if len(e.unsentXIDErrors) == 0 {
 		return nil, nil
 	}
@@ -822,4 +834,71 @@ func (e *GpuMetricsExporter) getXIDErrors() ([]string, error) {
 	result := make([]string, len(e.unsentXIDErrors))
 	copy(result, e.unsentXIDErrors)
 	return result, nil
+}
+
+// trimUnsentXIDErrors bounds the pending re-ship buffer to maxUnsentXIDErrors.
+// Left unbounded, the buffer grows the payload on every tick the host stays
+// unreachable, and once the gzipped frame passes the 64 KiB vsock limit
+// SendData fails on size permanently — the exporter would never recover, even
+// after the host came back. Oldest lines go first (the newest describe the
+// current fault) and the loss is counted into xidErrorsDropped so it reaches
+// the host as XIDErrors.DroppedCount rather than vanishing.
+//
+// Callers must hold lastMetricsMu.
+func (e *GpuMetricsExporter) trimUnsentXIDErrors() {
+	overflow := len(e.unsentXIDErrors) - maxUnsentXIDErrors
+	if overflow <= 0 {
+		return
+	}
+
+	dropped := e.unsentXIDErrors[:overflow]
+	e.unsentXIDErrors = append([]string(nil), e.unsentXIDErrors[overflow:]...)
+	e.xidErrorsDropped += int64(overflow)
+	e.log.Warn("XID buffer full, dropped oldest lines",
+		zap.Int("dropped", overflow),
+		zap.Int("max", maxUnsentXIDErrors),
+		zap.Int64("droppedTotal", e.xidErrorsDropped),
+		zap.Strings("droppedLines", dropped))
+}
+
+// pruneSentXIDErrors drops delivered-line records older than retention, then
+// trims what remains to the maxSentXIDErrors most recent as a backstop against
+// a dmesg window carrying more distinct lines than age alone retires.
+//
+// Evicting a record whose line is still inside the dmesg look-back window would
+// re-ship that line once. Callers pass a retention of twice the window, so
+// age-based pruning never does this; only the size backstop can, and it trips
+// solely during an XID storm where a duplicate is the lesser problem.
+//
+// Callers must hold lastMetricsMu.
+func (e *GpuMetricsExporter) pruneSentXIDErrors(now time.Time, retention time.Duration) {
+	for line, sentAt := range e.sentXIDErrors {
+		if now.Sub(sentAt) > retention {
+			delete(e.sentXIDErrors, line)
+		}
+	}
+
+	if len(e.sentXIDErrors) <= maxSentXIDErrors {
+		return
+	}
+
+	lines := make([]string, 0, len(e.sentXIDErrors))
+	for line := range e.sentXIDErrors {
+		lines = append(lines, line)
+	}
+	// Newest first, so everything past the cap is the oldest.
+	slices.SortFunc(lines, func(a, b string) int {
+		return e.sentXIDErrors[b].Compare(e.sentXIDErrors[a])
+	})
+	for _, line := range lines[maxSentXIDErrors:] {
+		delete(e.sentXIDErrors, line)
+	}
+}
+
+// xidErrorsDroppedCount returns the cumulative number of XID/SXID lines
+// discarded because the pending re-ship buffer overflowed.
+func (e *GpuMetricsExporter) xidErrorsDroppedCount() int64 {
+	e.lastMetricsMu.RLock()
+	defer e.lastMetricsMu.RUnlock()
+	return e.xidErrorsDropped
 }

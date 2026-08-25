@@ -2,6 +2,7 @@ package gpumetricsexporter
 
 import (
 	"fmt"
+	"time"
 
 	"go.mws.cloud/gpu-metrics-exporter/pkg/gpumetrics"
 	"go.mws.cloud/gpu-metrics-exporter/pkg/vsock/client"
@@ -53,13 +54,16 @@ func (e *GpuMetricsExporter) sendMetrics(m *gpumetrics.GpuMetrics) error {
 	e.lastMetricsMu.Lock()
 	defer e.lastMetricsMu.Unlock()
 
-	for _, line := range m.XIDErrors.XIDErrors {
-		if e.sentXIDErrors == nil {
-			e.sentXIDErrors = make(map[string]struct{})
-		}
-		e.sentXIDErrors[line] = struct{}{}
-	}
 	if len(m.XIDErrors.XIDErrors) > 0 {
+		if e.sentXIDErrors == nil {
+			e.sentXIDErrors = make(map[string]time.Time, len(m.XIDErrors.XIDErrors))
+		}
+		// Stamp the delivery time so pruneSentXIDErrors can retire the record
+		// once the line can no longer reappear in the dmesg look-back window.
+		now := time.Now()
+		for _, line := range m.XIDErrors.XIDErrors {
+			e.sentXIDErrors[line] = now
+		}
 		e.unsentXIDErrors = removeStrings(e.unsentXIDErrors, m.XIDErrors.XIDErrors)
 	}
 	return nil
