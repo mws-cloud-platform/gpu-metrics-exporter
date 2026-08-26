@@ -7,11 +7,12 @@ ARG GO_SHA256=ceb5e041bbc3893846bd1614d76cb4681c91dadee579426cf21a63f2d7e03be6
 # Injected into both binaries via -ldflags "-X main.version=…"; empty for dev builds.
 ARG VERSION=""
 
-# Optional apt mirror. archive.ubuntu.com / security.ubuntu.com are poorly
-# reachable from some networks (Russia in particular), so the mirror is
-# configurable rather than hard-coded: pass --build-arg APT_MIRROR="" to use
-# Ubuntu's default archives, or point it at any mirror you prefer.
-ARG APT_MIRROR="http://mirror.yandex.ru/ubuntu"
+# Optional apt mirror. Defaults to Ubuntu's own archives so the image builds
+# anywhere. archive.ubuntu.com / security.ubuntu.com are poorly reachable from
+# some networks (Russia in particular) — build with
+#   --build-arg APT_MIRROR=http://mirror.yandex.ru/ubuntu
+# to substitute a mirror.
+ARG APT_MIRROR=""
 RUN if [ -n "$APT_MIRROR" ]; then \
         sed -i \
             -e "s|http://archive.ubuntu.com/ubuntu|${APT_MIRROR}|g" \

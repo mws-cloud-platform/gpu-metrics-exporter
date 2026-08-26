@@ -345,6 +345,21 @@ make deb VERSION=2026.06.08-2
 ```
 This writes `dist/gpu-metrics-exporter_<version>_amd64.deb` and `dist/gpu-metrics-receiver_<version>_amd64.deb`. If `VERSION` is omitted, it falls back to `git describe --tags --always`.
 
+Other targets: `make docker-test` (test suite in the build container), `make lint`
+(golangci-lint, pinned to the same image CI uses), and `make cover` (coverage
+across all packages, including the Linux-only tests).
+
+The build image installs packages from Ubuntu's own archives. Where those are
+slow or blocked, substitute a mirror:
+
+```bash
+docker build --platform linux/amd64 -f docker/local-build.Dockerfile \
+  --build-arg APT_MIRROR=http://mirror.yandex.ru/ubuntu .
+```
+
+The Go toolchain tarball is checksum-verified during the build; `GO_SHA256` in
+`docker/local-build.Dockerfile` must be updated whenever `GO_VERSION` is.
+
 CI (`.github/workflows/build.yml`) runs the test suite (`make docker-test`, in a linux/amd64 container), then builds the binaries on every commit / pull request (uploaded as a workflow artifact, not published), and runs the tests + builds + publishes the `.deb` packages to a GitHub Release on a tag push, using the tag name as the version.
 
 ## License
