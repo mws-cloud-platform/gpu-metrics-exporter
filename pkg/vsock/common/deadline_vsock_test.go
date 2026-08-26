@@ -121,7 +121,7 @@ func TestVsockReadDeadlineEnforced(t *testing.T) {
 	_, server := newVsockLoopbackConns(t, 54332)
 
 	const timeout = 300 * time.Millisecond
-	server.SetReadDeadline(time.Now().Add(timeout))
+	_ = server.SetReadDeadline(time.Now().Add(timeout))
 
 	start := time.Now()
 	_, err := server.RecvData()
@@ -148,7 +148,7 @@ func TestVsockReadDeadlineAllowsNormalTraffic(t *testing.T) {
 		_ = client.SendData(payload)
 	}()
 
-	server.SetReadDeadline(time.Now().Add(5 * time.Second))
+	_ = server.SetReadDeadline(time.Now().Add(5 * time.Second))
 	got, err := server.RecvData()
 	if err != nil {
 		t.Fatalf("RecvData under an armed deadline: %v", err)
@@ -165,11 +165,11 @@ func TestVsockReadDeadlineCleared(t *testing.T) {
 	client, server := newVsockLoopbackConns(t, 54334)
 
 	// Arm, let it expire, then clear.
-	server.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+	_ = server.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
 	if _, err := server.RecvData(); !errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("priming read = %v, want os.ErrDeadlineExceeded", err)
 	}
-	server.SetReadDeadline(time.Time{})
+	_ = server.SetReadDeadline(time.Time{})
 
 	payload := []byte("after clearing")
 	go func() {

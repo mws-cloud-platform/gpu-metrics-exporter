@@ -41,7 +41,7 @@ func NewClientConnection(log *zap.Logger, port int) (*common.VsockConn, error) {
 	}
 	if err := unix.Connect(fd, sa); err != nil {
 		log.Error("unix.Connect", zap.Error(err))
-		unix.Close(fd)
+		_ = unix.Close(fd)
 		return nil, err
 	}
 

@@ -41,7 +41,7 @@ func main() {
 }
 
 func run(logger *zap.Logger, port int, periodSecs int, version string) error {
-	defer logger.Sync()
+	defer func() { _ = logger.Sync() }()
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

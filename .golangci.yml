@@ -1,0 +1,31 @@
+version: "2"
+
+# Mirrors what CI runs (`make lint`). golangci-lint must be built with a Go
+# toolchain at least as new as go.mod's `go` directive, and it needs a C
+# compiler because go-nvml is cgo — so use the Debian-based image, not alpine.
+linters:
+  # The standard set: errcheck, govet, ineffassign, staticcheck, unused.
+  default: standard
+  enable:
+    - misspell
+
+  exclusions:
+    rules:
+      # pkg/gpumetrics/vN packages are frozen snapshots of wire formats that are
+      # already deployed in guest VMs. Their misspellings (tx_throughtput,
+      # rx_throughtput) are the real spelling in payloads on the wire, so a
+      # linter must never nudge anyone into "correcting" them — that would
+      # silently change how historical payloads decode.
+      - path: pkg/gpumetrics/v[0-9]+/
+        linters:
+          - misspell
+
+      # The same misspellings appear in the upconverter and its tests, which
+      # exist precisely to translate them.
+      - path: pkg/gpumetrics/(wire_version|wire_version_test|golden_v1_test)\.go
+        linters:
+          - misspell
+
+formatters:
+  enable:
+    - gofmt

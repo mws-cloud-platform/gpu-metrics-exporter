@@ -102,7 +102,7 @@ func (r *GpuMetricsReceiver) shutdown() {
 	r.connectionsMu.Lock()
 	r.log.Info("closing listen fd")
 	if r.listener != nil {
-		r.listener.Close()
+		_ = r.listener.Close()
 		r.listener = nil
 	}
 
@@ -123,7 +123,7 @@ func (r *GpuMetricsReceiver) shutdown() {
 	r.connectionsMu.Unlock()
 
 	for _, conn := range connections {
-		conn.Close()
+		_ = conn.Close()
 	}
 
 	r.log.Info("closed fd")
@@ -198,7 +198,7 @@ func (r *GpuMetricsReceiver) handleConnection(conn *common.VsockConn) {
 		r.connectionsMu.Unlock()
 
 		if ok {
-			conn.Close()
+			_ = conn.Close()
 		}
 	}()
 	r.log.Info("exporter connected", zap.Any("remote", conn.RemoteAddr()))
@@ -208,7 +208,7 @@ func (r *GpuMetricsReceiver) handleConnection(conn *common.VsockConn) {
 		// (or after sending just a header) is dropped instead of pinning this
 		// goroutine and its fd until process shutdown.
 		if r.readTimeout > 0 {
-			conn.SetReadDeadline(time.Now().Add(r.readTimeout))
+			_ = conn.SetReadDeadline(time.Now().Add(r.readTimeout))
 		}
 
 		data, err := conn.RecvData()
@@ -269,7 +269,7 @@ func (r *GpuMetricsReceiver) serveConnection(conn *common.VsockConn) {
 	if r.stopping.Load() != 0 {
 		r.connectionsMu.Unlock()
 		r.log.Info("already stopping -> close accepted connection")
-		conn.Close()
+		_ = conn.Close()
 		return
 	}
 	// Bound untrusted guest connections: a misbehaving VM must not be able to
@@ -280,7 +280,7 @@ func (r *GpuMetricsReceiver) serveConnection(conn *common.VsockConn) {
 		r.log.Warn("max connections reached, rejecting connection",
 			zap.Int("current", len(r.connections)), zap.Int("max", r.maxConnections),
 			zap.Uint32("clientID", cid))
-		conn.Close()
+		_ = conn.Close()
 		return
 	}
 	if r.maxConnectionsPerCID > 0 && r.cidCounts != nil && r.cidCounts[cid] >= r.maxConnectionsPerCID {
@@ -288,7 +288,7 @@ func (r *GpuMetricsReceiver) serveConnection(conn *common.VsockConn) {
 		r.log.Warn("max per-CID connections reached, rejecting connection",
 			zap.Uint32("clientID", cid), zap.Int("current", r.cidCounts[cid]),
 			zap.Int("max", r.maxConnectionsPerCID))
-		conn.Close()
+		_ = conn.Close()
 		return
 	}
 	r.connections[conn] = struct{}{}

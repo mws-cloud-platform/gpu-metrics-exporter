@@ -99,7 +99,7 @@ func gunzip(data []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer reader.Close()
+	defer func() { _ = reader.Close() }()
 	return io.ReadAll(reader)
 }
 
@@ -230,7 +230,7 @@ func compressRaw(jsonData []byte) ([]byte, error) {
 	var buf bytes.Buffer
 	writer := gzip.NewWriter(&buf)
 	if _, err := writer.Write(jsonData); err != nil {
-		writer.Close()
+		_ = writer.Close()
 		return nil, err
 	}
 	if err := writer.Close(); err != nil {

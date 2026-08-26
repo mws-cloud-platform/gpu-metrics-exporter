@@ -1,5 +1,11 @@
 # GPU metrics exporter
 
+[![build](https://github.com/mws-cloud-platform/gpu-metrics-exporter/actions/workflows/build.yml/badge.svg)](https://github.com/mws-cloud-platform/gpu-metrics-exporter/actions/workflows/build.yml)
+[![Go Report Card](https://goreportcard.com/badge/go.mws.cloud/gpu-metrics-exporter)](https://goreportcard.com/report/go.mws.cloud/gpu-metrics-exporter)
+![Last Commit](https://img.shields.io/github/last-commit/mws-cloud-platform/gpu-metrics-exporter)
+![Go Version](https://img.shields.io/badge/Go-1.25%2B-blue)
+![License](https://img.shields.io/badge/License-Apache%202.0-blue)
+
 ## Goal
 Install a GPU metrics exporter in the guest VM
 and pass various GPU device metrics from the

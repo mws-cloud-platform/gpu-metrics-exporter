@@ -32,7 +32,6 @@ type GpuMetricsExporter struct {
 	seqno                 atomic.Int64
 	config                GpuMetricsExporterConfig
 	startTime             int64
-	instanceID            string
 	initNVMLError         string
 	sendMetricsErrorCount int64
 	sendMetricsLastError  string
@@ -135,7 +134,7 @@ func (e *GpuMetricsExporter) sendMetricsLoop(ctx context.Context) {
 	for {
 		select {
 		case m := <-e.metricsQueue:
-			e.sendMetrics(m)
+			_ = e.sendMetrics(m)
 		case <-ctx.Done():
 			e.log.Info("received stop signal")
 			return

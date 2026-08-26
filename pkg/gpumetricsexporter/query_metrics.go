@@ -296,9 +296,10 @@ func (e *GpuMetricsExporter) collectClockSpeeds(device nvml.Device, info *gpumet
 
 func (e *GpuMetricsExporter) collectFanSpeed(device nvml.Device, info *gpumetrics.GPUInfo) {
 	fanSpeed, ret := device.GetFanSpeed()
-	if ret == nvml.SUCCESS {
+	switch ret {
+	case nvml.SUCCESS:
 		info.FanSpeed = uint(fanSpeed)
-	} else if ret == nvml.ERROR_NOT_SUPPORTED {
+	case nvml.ERROR_NOT_SUPPORTED:
 		// Device doesn't have a fan - this is normal for data center GPUs
 		info.FanSpeed = 0
 	}

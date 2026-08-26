@@ -329,7 +329,7 @@ func TestReadDeadlineExceeded(t *testing.T) {
 	_ = sender // nothing is sent: the receiver must time out
 
 	// Tight deadline; generous check window relative to it.
-	receiver.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	_ = receiver.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
 
 	done := make(chan error, 1)
 	go func() {
@@ -351,7 +351,7 @@ func TestReadDeadlineExceeded(t *testing.T) {
 // deadline in the past returns immediately without touching the socket.
 func TestReadDeadlineExpiredBeforeRead(t *testing.T) {
 	_, receiver := newSocketpairConns(t)
-	receiver.SetReadDeadline(time.Now().Add(-time.Second))
+	_ = receiver.SetReadDeadline(time.Now().Add(-time.Second))
 
 	_, err := receiver.RecvData()
 	if !errors.Is(err, os.ErrDeadlineExceeded) {

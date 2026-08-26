@@ -4,8 +4,12 @@ BIN_DIR     := bin
 DIST_DIR    := dist
 # Deb version; empty -> scripts/build-deb.sh falls back to `git describe --tags --always`.
 VERSION     ?=
+# Pinned so `make lint` and CI run byte-identical checks. Must be built with a Go
+# toolchain >= go.mod's `go` directive; the Debian image (not -alpine) is required
+# because go-nvml is cgo and needs a C compiler.
+GOLANGCI_IMAGE ?= golangci/golangci-lint:v2.13.1
 
-.PHONY: gpu-metrics-exporter gpu-metrics-receiver docker-build deb docker-test fmt vet test clean
+.PHONY: gpu-metrics-exporter gpu-metrics-receiver docker-build deb docker-test fmt vet lint test cover clean
 
 gpu-metrics-exporter: cmd/gpu-metrics-exporter/main.go
 	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -o ./gpu-metrics-exporter cmd/gpu-metrics-exporter/main.go
@@ -45,8 +49,23 @@ vet:
 	go vet ./...
 
 
+# Same image and flags CI uses, so a green local run means a green CI run.
+lint:
+	docker run --rm --platform linux/amd64 \
+		-v "$(CURDIR)":/src -w /src -e GOFLAGS=-buildvcs=false \
+		$(GOLANGCI_IMAGE) golangci-lint run --timeout 5m
+
+
 test:
 	go test -v ./...
+
+
+# Coverage across all packages. Runs in the build container so linux-only tests
+# (see pkg/vsock/common/deadline_vsock_test.go) are included in the figure.
+cover:
+	docker build --platform linux/amd64 -f docker/local-build.Dockerfile --target builder -t $(IMAGE_NAME)-test .
+	docker run --rm --platform linux/amd64 $(IMAGE_NAME)-test \
+		sh -c 'go test -count=1 -coverprofile=/tmp/cover.out ./... >/dev/null && go tool cover -func=/tmp/cover.out | tail -1'
 
 
 clean:

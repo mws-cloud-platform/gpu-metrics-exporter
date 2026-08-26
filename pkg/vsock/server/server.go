@@ -97,7 +97,7 @@ func NewVsockListener(log *zap.Logger, port int) (*VsockListener, error) {
 	}
 	if err := unix.SetNonblock(fd, true); err != nil {
 		log.Error("unix.SetNonblock", zap.Error(err))
-		unix.Close(fd)
+		_ = unix.Close(fd)
 		return nil, err
 	}
 
@@ -108,14 +108,14 @@ func NewVsockListener(log *zap.Logger, port int) (*VsockListener, error) {
 	}
 	if err := unix.Bind(fd, sa); err != nil {
 		log.Error("unix.Bind", zap.Error(err))
-		unix.Close(fd)
+		_ = unix.Close(fd)
 		return nil, err
 	}
 
 	// Listen
 	if err := unix.Listen(fd, vsockListenBacklog); err != nil {
 		log.Error("unix.Listen", zap.Error(err))
-		unix.Close(fd)
+		_ = unix.Close(fd)
 		return nil, err
 	}
 

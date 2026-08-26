@@ -283,7 +283,7 @@ func compressJSON(data interface{}) ([]byte, error) {
 	var buf bytes.Buffer
 	writer := gzip.NewWriter(&buf)
 	if _, err := writer.Write(jsonData); err != nil {
-		writer.Close()
+		_ = writer.Close()
 		return nil, err
 	}
 
@@ -292,16 +292,4 @@ func compressJSON(data interface{}) ([]byte, error) {
 	}
 
 	return buf.Bytes(), nil
-}
-
-// decompressJSON gzip-decompresses compressed and JSON-decodes the result into
-// target.
-func decompressJSON(compressed []byte, target interface{}) error {
-	reader, err := gzip.NewReader(bytes.NewReader(compressed))
-	if err != nil {
-		return err
-	}
-	defer reader.Close()
-
-	return json.NewDecoder(reader).Decode(target)
 }

@@ -27,8 +27,8 @@ func (e *GpuMetricsExporter) sendMetrics(m *gpumetrics.GpuMetrics) error {
 	}
 	defer func() {
 		// send empty data to close connection on other side
-		c.SendData(make([]byte, 0))
-		c.Close()
+		_ = c.SendData(make([]byte, 0))
+		_ = c.Close()
 	}()
 
 	data, err := m.ToBytes()
