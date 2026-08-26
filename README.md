@@ -82,9 +82,49 @@ counter (`sbe_pages`, `correctable`, …), which every payload carries in full;
 
 | Field | Description |
 | --- | --- |
+| `wire_version` | Format version the exporter speaks (see [Wire format versioning](#wire-format-versioning)) |
 | `source.vsock_client_id` | Guest VM vsock CID, filled in by the receiver from the peer address |
 | `source.instance_id` | Cloud-init instance ID (read from `/var/lib/cloud/data/instance-id`) |
 | `gpu_device_count` | Number of NVIDIA GPUs detected |
+
+### Wire format versioning
+
+The exporter runs inside a guest VM. Exporter and receiver ship as independent
+`.deb` packages, and an exporter can stay deployed for a long time, so the
+receiver must decode every format version it has ever shipped. The protocol is
+one-way — the exporter never reads anything back — so all compatibility work
+lives on the receiver.
+
+`NewGpuMetricsFromBytes` reads `wire_version` first, decodes the payload with
+the matching struct, and upconverts it to the current shape. **Consumers always
+receive the current shape**; they never branch on version to read a field.
+
+| Version | Shipped in | Changes |
+| --- | --- | --- |
+| 1 | `2026.07.29-1` | Original format. Carries no `wire_version` field, so an absent value is read as v1. Spells the PCIe throughput keys `tx_throughtput` / `rx_throughtput` |
+| 2 | current | Renames those to `tx_throughput` / `rx_throughput`; adds `gpu_info[].mig_info` and `xid_errors.dropped_count` |
+
+`wire_version` on a decoded payload reports what the **exporter** spoke, not the
+shape you are holding. It is the only way to tell "the exporter reported zero"
+from "the exporter was too old to report at all" — a v1 payload has
+`mig_info.supported = false` because v1 never queried MIG, not because the GPU
+lacks it. Aggregate this field across the fleet to know when it is safe to drop
+support for a version.
+
+When changing the format:
+
+- **Additive changes need no bump.** An old receiver ignores unknown fields; a
+  new receiver reads an absent field as zero.
+- **Bump for anything else** — a renamed or retyped key, changed units, or
+  restructured nesting. Then freeze the previous structs in
+  `pkg/gpumetrics/vN/` and add an upconverter. Frozen packages are never edited:
+  they describe bytes already in the field.
+- **A changed encoding** (gzip+JSON → something else) is the one case a payload
+  field cannot announce, since you must parse the payload to read it. Bump the
+  frame `Magic` in `pkg/vsock/common` instead, so old receivers fail loudly
+  rather than misparsing.
+- `exporter_info.version` is a build ID, not a schema version. Never dispatch
+  on it.
 
 ### Exporter health (`exporter_info`)
 

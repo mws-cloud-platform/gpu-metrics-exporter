@@ -1,16 +1,22 @@
-package gpumetrics
+// Package v1 is a frozen snapshot of the metrics wire format as shipped in tag
+// 2026.07.29-1.
+//
+// It exists so the receiver can still decode payloads from exporters running in
+// guest VMs that have not been upgraded — and since customers have root, some
+// never will. Nothing here may be edited: these structs describe bytes that are
+// already in the field, so a "fix" would silently change how historical
+// payloads decode. Field names, json tags, and types are all load-bearing,
+// including the tx_throughtput/rx_throughtput misspellings, which are the real
+// spelling in v1 payloads.
+//
+// New work belongs in the current package; upconvertV1 maps these into it.
+package v1
 
-import (
-	"bytes"
-	"compress/gzip"
-	"encoding/json"
-)
-
-// GpuMetricsSource identifies where a metrics payload originated: the guest
+// GpuMetricsSouce identifies where a metrics payload originated: the guest
 // VM's vsock CID (filled in by the receiver from the peer address) and its
 // cloud-init instance ID (read by the exporter). Downstream code is expected
 // to map VsockClientID -> VMID.
-type GpuMetricsSource struct {
+type GpuMetricsSouce struct {
 	VsockClientID uint32 `json:"vsock_client_id"`
 	InstanceID    string `json:"instance_id"`
 }
@@ -58,53 +64,6 @@ type GPUInfo struct {
 	Architecture          string                `json:"architecture"`
 	CUDAComputeCapability CUDAComputeCapability `json:"cuda_compute_capability"`
 	PersistenceMode       int                   `json:"persistence_mode"`
-	MIG                   MIGInfo               `json:"mig_info"`
-}
-
-// MIGInfo describes a GPU's Multi-Instance GPU partitioning.
-//
-// Supported is false on GPUs where NVML reports MIG as unsupported at all
-// (anything pre-Ampere, and Ampere+ cards whose driver refuses the query); the
-// remaining fields are meaningless then. Enabled reflects the mode in force
-// now, PendingEnabled the mode NVML will apply once the GPU is reset or all
-// clients release it, and PendingChange is the actionable difference: the two
-// disagree, so the partitioning an operator asked for is not the one running.
-//
-// Reading Enabled matters beyond MIG itself: with MIG on, NVML answers many
-// whole-device queries — utilization, per-device ECC volatile counters, clocks
-// — with NOT_SUPPORTED. The collectors treat that as "leave zero-valued", so a
-// MIG-enabled GPU reports zeros that a consumer would otherwise read as a genuinely
-// idle card. mig_info.enabled is how to tell those two apart.
-type MIGInfo struct {
-	Supported      bool          `json:"supported"`
-	Enabled        bool          `json:"enabled"`
-	PendingEnabled bool          `json:"pending_enabled"`
-	PendingChange  bool          `json:"pending_change"`
-	InstanceCount  int           `json:"instance_count"`
-	Instances      []MIGInstance `json:"instances"`
-	Error          string        `json:"error"`
-}
-
-// MIGInstance is one instantiated MIG device: a compute instance within a GPU
-// instance, which NVML addresses through its own device handle.
-//
-// GpuInstanceID and ComputeInstanceID are the identifiers NVML and nvidia-smi
-// use to name the partition, and together with the parent GPU's UUID they
-// identify it across ticks. SliceCount fields give the partition's size in the
-// card's slice units (e.g. 3 of 7 on an A100 3g.40gb).
-type MIGInstance struct {
-	Index                     int    `json:"index"`
-	UUID                      string `json:"uuid"`
-	Name                      string `json:"name"`
-	GpuInstanceID             int    `json:"gpu_instance_id"`
-	ComputeInstanceID         int    `json:"compute_instance_id"`
-	MemoryTotal               uint64 `json:"memory_total_bytes"`
-	MemoryUsed                uint64 `json:"memory_used_bytes"`
-	MemoryFree                uint64 `json:"memory_free_bytes"`
-	MultiprocessorCount       uint   `json:"multiprocessor_count"`
-	GpuInstanceSliceCount     uint   `json:"gpu_instance_slice_count"`
-	ComputeInstanceSliceCount uint   `json:"compute_instance_slice_count"`
-	Error                     string `json:"error"`
 }
 
 // GPUUtilization holds current GPU and memory utilization as percentages.
@@ -131,8 +90,8 @@ type PCIInfo struct {
 	LinkWidth    uint   `json:"link_width_current"`
 	MaxPCIGen    uint   `json:"max_pci_generation"`
 	MaxLinkWidth uint   `json:"max_link_width"`
-	TxThroughput uint32 `json:"tx_throughput"`
-	RxThroughput uint32 `json:"rx_throughput"`
+	TxThroughput uint32 `json:"tx_throughtput"`
+	RxThroughput uint32 `json:"rx_throughtput"`
 }
 
 // ECCInfo holds the GPU's ECC mode and error counters for DRAM/SRAM memory and
@@ -187,8 +146,7 @@ type RowRemappingInfo struct {
 	Error              string `json:"error"`
 }
 
-// ClocksThrottleInfo holds the GPU's current clocks throttle and event reasons
-// (bitmasks) plus their human-readable forms.
+// Clocks throttle information
 type ClocksThrottleInfo struct {
 	ThrottleReasons    uint64 `json:"throttle_reasons"`
 	ThrottleReasonsStr string `json:"throttle_reasons_string"`
@@ -196,7 +154,7 @@ type ClocksThrottleInfo struct {
 	EventReasonsStr    string `json:"event_reasons_string"`
 }
 
-// NvLinkInfo holds per-link NVLink state and error counters for a GPU.
+// NVLink information
 type NvLinkInfo struct {
 	Links []NvLinkState `json:"links"`
 }
@@ -236,72 +194,19 @@ type NvFabricManagerStatus struct {
 }
 
 // XIDErrors holds recent XID/SXID error lines collected from the kernel log.
-// A line is re-shipped on every payload until one carrying it is confirmed
-// delivered, so a transient send failure cannot lose an error. DroppedCount is
-// the cumulative number of lines the exporter had to discard because that
-// pending buffer overflowed — non-zero means XID errors were lost, and the
-// kernel log on the guest is the only remaining record of them.
 type XIDErrors struct {
-	Error        string   `json:"error"`
-	XIDErrors    []string `json:"xid_errors"`
-	DroppedCount int64    `json:"dropped_count"`
+	Error     string   `json:"error"`
+	XIDErrors []string `json:"xid_errors"`
 }
 
 // GpuMetrics is the top-level payload exchanged between the guest exporter and
 // the host receiver: provenance, exporter health, fabric-manager status, XID
 // errors, and one GPUInfo entry per detected GPU.
 type GpuMetrics struct {
-	// WireVersion is the format version the *exporter* spoke, not the shape of
-	// this struct: NewGpuMetricsFromBytes always returns the current shape,
-	// upconverting older payloads into it. So a value below CurrentWireVersion
-	// means some fields could not possibly have been populated — a v1 exporter
-	// knows nothing of mig_info or xid_errors.dropped_count, and their zero
-	// values mean "not reported", not "reported as zero". Consumers that care
-	// about the difference must check this.
-	WireVersion           int                   `json:"wire_version"`
-	Source                GpuMetricsSource      `json:"source"`
+	Source                GpuMetricsSouce       `json:"source"`
 	ExporterInfo          ExporterInfo          `json:"exporter_info"`
 	NvFabricManagerStatus NvFabricManagerStatus `json:"nv_fabric_manager_status"`
 	XIDErrors             XIDErrors             `json:"xid_errors"`
 	GpuDeviceCount        int                   `json:"gpu_device_count"`
 	Gpus                  []GPUInfo             `json:"gpu_info"`
-}
-
-// NewGpuMetrics returns a zero-value GpuMetrics ready to be populated.
-func NewGpuMetrics() *GpuMetrics {
-	m := &GpuMetrics{WireVersion: CurrentWireVersion}
-	return m
-}
-
-// compressJSON marshals v to JSON and gzip-compresses the result.
-func compressJSON(data interface{}) ([]byte, error) {
-	jsonData, err := json.Marshal(data)
-	if err != nil {
-		return nil, err
-	}
-
-	var buf bytes.Buffer
-	writer := gzip.NewWriter(&buf)
-	if _, err := writer.Write(jsonData); err != nil {
-		writer.Close()
-		return nil, err
-	}
-
-	if err := writer.Close(); err != nil {
-		return nil, err
-	}
-
-	return buf.Bytes(), nil
-}
-
-// decompressJSON gzip-decompresses compressed and JSON-decodes the result into
-// target.
-func decompressJSON(compressed []byte, target interface{}) error {
-	reader, err := gzip.NewReader(bytes.NewReader(compressed))
-	if err != nil {
-		return err
-	}
-	defer reader.Close()
-
-	return json.NewDecoder(reader).Decode(target)
 }

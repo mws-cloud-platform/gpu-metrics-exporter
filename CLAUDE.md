@@ -52,6 +52,16 @@ CI lives in `.github/workflows/build.yml` (GitHub Actions). On every branch push
 ### Wire format (`pkg/gpumetrics` + `pkg/vsock/common`)
 `GpuMetrics.ToBytes()` → JSON → gzip. Over vsock each message is framed by `VsockFrameHeader{Magic 0xBEADBEAF, Len, xxhash64}` with a 64 KiB max payload (`SendData`/`RecvData` in `pkg/vsock/common/common.go`). An empty (Len=0) frame is the exporter's "I'm done, close" signal — the receiver treats `ErrNoData` as a clean end-of-stream and breaks out of the read loop. `wire_test.go` round-trips a fully-populated payload so a regression in any json tag shows up as a diff; `common_test.go` covers framing (short reads, truncation, hash mismatch, oversized frames).
 
+**Versioning (`wire_version.go`).** The payload carries `wire_version`; `CurrentWireVersion` is what this build writes. Because the exporter lives in a customer VM (root, may never upgrade) and the protocol is one-way, the receiver must decode every version ever shipped and all compatibility lives receiver-side. `NewGpuMetricsFromBytes` decodes a small `wireEnvelope` first, dispatches to the matching structs, and upconverts — **consumers always get the current shape and must never branch on version to read a field**. v1 (tag `2026.07.29-1`) predates the field, so absent (`0`) is read as 1; a version *above* current decodes optimistically as current rather than being dropped.
+
+Rules when changing the format:
+- Additive changes need no bump. Bump only for a rename, retype, unit change, or restructure — then freeze the old structs in `pkg/gpumetrics/vN/` (**never edit a frozen package**: it describes bytes already in the field) and add an upconverter to the chain.
+- A changed *encoding* can't be announced by a payload field — bump the frame `Magic` instead so old receivers fail loudly.
+- `ExporterInfo.Version` is a build ID, not a schema version; never dispatch on it.
+- The returned `WireVersion` is the version the *exporter* spoke. It's what separates "reported zero" from "too old to report" — a v1 payload has empty `mig_info` because v1 never collected it.
+
+`TestUpconvertV1LosesNothing` reflectively fills every v1 field, flattens both sides to json paths, and asserts each one survives — so a field forgotten in an upconverter fails the build instead of silently arriving as zero. `testdata/v1_payload.json` is a readable golden fixture of a real v1 payload.
+
 ### Vsock I/O (`pkg/vsock`)
 `server.VsockListener` creates a non-blocking AF_VSOCK SOCK_STREAM socket bound to `VMADDR_CID_ANY`, and `Accept` polls (100 ms timeout) so `ctx.Done()` / `Close()` can interrupt it — the receiver uses context cancellation + `Close()` for shutdown. `client.NewClientConnection` connects to `VMADDR_CID_HOST` (CID 2). The exporter opens a **fresh connection per send** (connect → SendData → send empty close-frame → Close); there is no persistent connection.
 
