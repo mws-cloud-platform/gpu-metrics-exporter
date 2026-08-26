@@ -74,6 +74,14 @@ JSON keys as they appear on the wire. Every per-GPU field is collected on a
 best-effort basis: unsupported features silently no-op and are left zero-valued
 rather than failing the tick.
 
+The facets NVML can decline to report — `ecc_info` and its counters,
+`retired_pages`, `row_remapping_info`, `nvlink_info` — carry a `supported` flag
+next to their `error`, and the two mean different things. `supported: false`
+with an empty `error` is hardware: an Ampere card has no retired pages, a
+pre-Ampere one no row remapping, a MIG-enabled one no volatile ECC counters.
+A non-empty `error` is a query that broke, and that is the one worth alerting
+on. Zero values only mean "zero" while `supported` is true.
+
 Cumulative counters carry a `*_delta` field giving the change since the previous
 tick (a counter reset/reboot yields 0). The baseline is the previous *collected*
 snapshot, not the previous delivered one, which makes deltas additive: summing
@@ -108,14 +116,17 @@ receive the current shape**; they never branch on version to read a field.
 | Version | Shipped in | Changes |
 | --- | --- | --- |
 | 1 | `2026.07.29-1` | Original format. Carries no `wire_version` field, so an absent value is read as v1. Spells the PCIe throughput keys `tx_throughtput` / `rx_throughtput` |
-| 2 | current | Renames those to `tx_throughput` / `rx_throughput`; adds `gpu_info[].mig_info` and `xid_errors.dropped_count` |
+| 2 | current | Renames those to `tx_throughput` / `rx_throughput`; adds `gpu_info[].mig_info` and `xid_errors.dropped_count`; splits "NVML does not report this" out of the error strings into a `supported` flag on `ecc_info`, its counters, `retired_pages`, `row_remapping_info` and `nvlink_info`, adds `ecc_info.error`, and stops emitting `nvlink_info.links[]` entries for link indices the GPU does not have |
 
 `wire_version` on a decoded payload reports what the **exporter** spoke, not the
 shape you are holding. It is the only way to tell "the exporter reported zero"
 from "the exporter was too old to report at all" — a v1 payload has
 `mig_info.supported = false` because v1 never queried MIG, not because the GPU
-lacks it. Aggregate this field across the fleet to know when it is safe to drop
-support for a version.
+lacks it. The same holds for `retired_pages.supported`: v1's collector read the
+field batch without checking each field's own status, so its counts are
+uninitialised bytes exactly where support was missing, and the receiver carries
+them through without claiming they were read. Aggregate `wire_version` across
+the fleet to know when it is safe to drop support for a version.
 
 When changing the format:
 
@@ -287,18 +298,22 @@ Each `mig_info.instances[]` entry:
 > genuinely idle GPU.
 | `cuda_compute_capability.major` / `.minor` | CUDA compute capability |
 
-**ECC (`ecc_info`)** — populated when ECC is enabled.
+**ECC (`ecc_info`)** — counters are populated when ECC is enabled.
 
 | Field | Description |
 | --- | --- |
+| `supported` | NVML answered the ECC-mode query. False with an empty `error` is a part without ECC; false with an `error` is a query that broke — both otherwise look like ECC switched off |
 | `enabled` | ECC currently enabled |
 | `pending` | ECC enable pending a reboot |
 | `mode` | `Enabled` / `Disabled` |
+| `error` | Error message if the ECC-mode query failed |
 | `dram_errors`, `sram_errors` | Counters per memory location, each split into `volatile` (since reset) and `aggregate` (lifetime) |
+| `*.volatile.supported` | NVML served this counter scope. A MIG-enabled GPU declines the whole volatile scope while still serving the aggregate one |
 | `*.volatile.correctable` / `uncorrectable` | Cumulative ECC error counts |
 | `*.volatile.correctable_delta` / `uncorrectable_delta` | Per-tick change |
 | `*.aggregate.*` | Same fields for the lifetime scope |
 | `*.error` | Error message if a counter read failed |
+| `retired_pages.supported` | False on every Ampere-and-later GPU: page retirement was replaced by row remapping, so read `row_remapping_info` there |
 | `retired_pages.sbe_pages` / `dbe_pages` | Retired pages (single-bit / double-bit errors) |
 | `retired_pages.pending_pages` | Pages pending retirement |
 | `retired_pages.*_delta` | Per-tick change for each retired-page counter |
@@ -308,6 +323,7 @@ Each `mig_info.instances[]` entry:
 
 | Field | Description |
 | --- | --- |
+| `supported` | False on pre-Ampere GPUs, which retire pages instead — the mirror of `retired_pages` |
 | `pending` | Remapping pending |
 | `failed` | Remapping failed |
 | `correctable` / `uncorrectable` | Cumulative remapped rows |
@@ -323,15 +339,18 @@ Each `mig_info.instances[]` entry:
 | `event_reasons` | Bitmask of clock event reasons |
 | `event_reasons_string` | Human-readable event reasons |
 
-**NVLink (`nvlink_info.links[]`)** — one entry per NVLink link index.
+**NVLink (`nvlink_info`)** — one `links[]` entry per link the GPU actually has,
+not one per possible link index: NVML's ceiling is 18 while an A100 has 12.
+Match on `index` rather than on position in the array.
 
 | Field | Description |
 | --- | --- |
-| `index` | Link index |
-| `state` | Link state (`Active`, `Inactive`, `Sleep`, `Unknown`) |
-| `errors` | Map of NVML error-counter type → cumulative count |
-| `errors_delta` | Map of error-counter type → per-tick change |
-| `error` | Error message |
+| `supported` | NVML reported at least one link. False means the GPU has no NVLink — which is what tells that apart from links that could not be enumerated, since neither produces entries |
+| `links[].index` | Link index as NVML numbers it |
+| `links[].state` | Link state (`Active`, `Inactive`, `Sleep`, `Unknown`) |
+| `links[].errors` | Map of NVML error-counter type → cumulative count. A missing key means NVML does not serve that counter, the normal answer for an inactive link |
+| `links[].errors_delta` | Map of error-counter type → per-tick change |
+| `links[].error` | Error message if a link query failed for some reason other than the counter being unavailable |
 
 ## How to build
 ```bash

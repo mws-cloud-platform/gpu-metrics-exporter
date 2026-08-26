@@ -21,6 +21,24 @@ type CUDAComputeCapability struct {
 	Minor int `json:"minor"`
 }
 
+// Facets NVML can decline to report — ECC counters, retired pages, row
+// remapping, NVLink — carry a Supported flag next to their Error string, and
+// the two say different things:
+//
+//	Supported=false, Error=""   the hardware or driver does not report this at
+//	                            all: an Ampere card has no retired pages, a
+//	                            pre-Ampere one no row remapping, a MIG-enabled
+//	                            one no volatile ECC counters. Normal, permanent,
+//	                            not worth an alert.
+//	Supported=true,  Error!=""  the query broke. That is the signal.
+//
+// Before the split, every NOT_SUPPORTED answer was written into Error, so a
+// healthy A100 shipped a dozen error strings per tick and any rule of the form
+// `error != ""` was pure noise — which is how a rule like that stops being read
+// at all. Zero values only mean "zero" while Supported is true; while it is
+// false they mean "not reported", the same way a zero means it for a field an
+// exporter too old to collect it never sent (see WireVersion).
+
 // GPUInfo represents the complete information we want to collect about a GPU
 type GPUInfo struct {
 	Index                 int                   `json:"index"`
@@ -137,18 +155,31 @@ type PCIInfo struct {
 
 // ECCInfo holds the GPU's ECC mode and error counters for DRAM/SRAM memory and
 // retired pages. Delta fields carry the per-tick change since the last report.
+//
+// Supported reports whether NVML answered the ECC-mode query at all. It is
+// what separates a card that does not do ECC from one whose ECC state could
+// not be read: both leave Enabled false and Mode empty, and only the second is
+// a fault. Error carries a genuine failure of that query.
 type ECCInfo struct {
+	Supported    bool              `json:"supported"`
 	Enabled      bool              `json:"enabled"`
 	Pending      bool              `json:"pending"`
 	Mode         string            `json:"mode"`
 	DRAMErrors   ECCErrorsCounters `json:"dram_errors"`
 	SRAMErrors   ECCErrorsCounters `json:"sram_errors"`
 	RetiredPages RetiredPagesInfo  `json:"retired_pages"`
+	Error        string            `json:"error"`
 }
 
 // ECCErrors holds correctable and uncorrectable ECC error counts for one
 // counter scope (volatile or aggregate), plus their per-tick deltas.
+//
+// Supported is true once NVML has returned a value for either counter in the
+// scope. A MIG-enabled GPU answers NOT_SUPPORTED for the whole volatile scope
+// while still serving the aggregate one, so the flag is per scope rather than
+// per GPU.
 type ECCErrors struct {
+	Supported          bool   `json:"supported"`
 	Correctable        uint64 `json:"correctable"`
 	Uncorrectable      uint64 `json:"uncorrectable"`
 	CorrectableDelta   int64  `json:"correctable_delta"`
@@ -165,7 +196,12 @@ type ECCErrorsCounters struct {
 
 // RetiredPagesInfo holds counts of retired GPU memory pages due to ECC errors,
 // with per-tick deltas. SBE = single-bit, DBE = double-bit.
+//
+// Supported is false on every Ampere-and-later GPU: page retirement was
+// replaced by row remapping there, so NVML reports none of the FI_DEV_RETIRED_*
+// fields. Read RowRemappingInfo on those cards.
 type RetiredPagesInfo struct {
+	Supported         bool   `json:"supported"`
 	SBEPages          uint64 `json:"sbe_pages"`
 	DBEPages          uint64 `json:"dbe_pages"`
 	SBEPagesDelta     int64  `json:"sbe_pages_delta"`
@@ -177,7 +213,11 @@ type RetiredPagesInfo struct {
 
 // RowRemappingInfo holds row remapping state for GPUs that support it, with
 // per-tick deltas of corrected and uncorrected remapped rows.
+//
+// Supported is false on pre-Ampere GPUs, which retire whole pages instead —
+// the mirror of RetiredPagesInfo, and the reason both carry the flag.
 type RowRemappingInfo struct {
+	Supported          bool   `json:"supported"`
 	Pending            bool   `json:"pending"`
 	Failed             bool   `json:"failed"`
 	Correctable        uint64 `json:"correctable"`
@@ -197,12 +237,25 @@ type ClocksThrottleInfo struct {
 }
 
 // NvLinkInfo holds per-link NVLink state and error counters for a GPU.
+//
+// Links carries one entry per link the GPU actually has, not one per possible
+// link index: NVML's NVLINK_MAX_LINKS is a header ceiling (18), while an A100
+// has 12 and a card with no NVLink at all has none. Entries keep their real
+// link index in LinkIndex, so match on that rather than on slice position.
+//
+// Supported says NVML reported at least one link, which is what makes an empty
+// Links distinguishable from a GPU whose links could not be enumerated.
 type NvLinkInfo struct {
-	Links []NvLinkState `json:"links"`
+	Supported bool          `json:"supported"`
+	Links     []NvLinkState `json:"links"`
 }
 
 // NvLinkState holds the state and per-error-type counters for a single NVLink
 // link, with per-tick deltas keyed by NVML error counter type.
+//
+// Errors holds only the counters NVML served; a missing key means that counter
+// is unavailable, which is the normal answer for an inactive link and not an
+// error. Error is reserved for a query that failed for some other reason.
 type NvLinkState struct {
 	LinkIndex   int            `json:"index"`
 	State       string         `json:"state"`

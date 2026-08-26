@@ -239,3 +239,122 @@ func decodeGzipped(t *testing.T, rawJSON []byte) *GpuMetrics {
 	}
 	return got
 }
+
+// TestUpconvertV1SplitsNotSupportedFromFailures pins the other half of the
+// upconverter's job. v1 wrote every non-SUCCESS NVML return into an error
+// string, so "this GPU has no row remapping" and "the row-remapping query
+// broke" arrived as the same kind of value; the receiver is where they are told
+// apart, so that a consumer never has to match on an error substring itself.
+func TestUpconvertV1SplitsNotSupportedFromFailures(t *testing.T) {
+	m1 := &v1.GpuMetrics{
+		GpuDeviceCount: 1,
+		Gpus: []v1.GPUInfo{{
+			Index: 0,
+			UUID:  "GPU-a100",
+			ECC: v1.ECCInfo{
+				Enabled: true, Mode: "Enabled",
+				DRAMErrors: v1.ECCErrorsCounters{
+					// The MIG shape: volatile declined, aggregate served.
+					Volatile:  v1.ECCErrors{Error: "failed to get volatile ECC correctable: Not Supported"},
+					Aggregate: v1.ECCErrors{Correctable: 12},
+				},
+				SRAMErrors: v1.ECCErrorsCounters{
+					Volatile:  v1.ECCErrors{Error: "failed to get volatile ECC correctable: Unknown Error"},
+					Aggregate: v1.ECCErrors{Correctable: 3},
+				},
+				RetiredPages: v1.RetiredPagesInfo{SBEPages: 2, DBEPages: 1},
+			},
+			RowRemapping: v1.RowRemappingInfo{Error: "device.GetRemappedRows error: Not Supported"},
+			NvLink:       v1.NvLinkInfo{Links: v1SampleLinks()},
+		}},
+	}
+
+	g := upconvertV1(m1).Gpus[0]
+
+	if !g.ECC.Supported {
+		t.Error("ECC.Supported = false although v1 reported an ECC mode")
+	}
+	if g.ECC.DRAMErrors.Volatile.Supported || g.ECC.DRAMErrors.Volatile.Error != "" {
+		t.Errorf("DRAM volatile = %+v, want unsupported with no error", g.ECC.DRAMErrors.Volatile)
+	}
+	if !g.ECC.DRAMErrors.Aggregate.Supported || g.ECC.DRAMErrors.Aggregate.Correctable != 12 {
+		t.Errorf("DRAM aggregate = %+v, want supported with its count intact", g.ECC.DRAMErrors.Aggregate)
+	}
+	if !g.ECC.SRAMErrors.Volatile.Supported || g.ECC.SRAMErrors.Volatile.Error == "" {
+		t.Errorf("SRAM volatile = %+v, want a preserved genuine failure", g.ECC.SRAMErrors.Volatile)
+	}
+	if g.RowRemapping.Supported || g.RowRemapping.Error != "" {
+		t.Errorf("RowRemapping = %+v, want unsupported with no error", g.RowRemapping)
+	}
+
+	// Retired pages are the one facet a v1 payload cannot settle: its collector
+	// read the field batch without checking each field's own status, so the
+	// counts are uninitialised bytes exactly where Supported would be false.
+	// The numbers ride through, unblessed.
+	if g.ECC.RetiredPages.Supported {
+		t.Error("RetiredPages.Supported = true; v1 carries nothing that proves support")
+	}
+	if g.ECC.RetiredPages.SBEPages != 2 || g.ECC.RetiredPages.DBEPages != 1 {
+		t.Errorf("RetiredPages counts = %+v, want them carried through", g.ECC.RetiredPages)
+	}
+
+	if !g.NvLink.Supported {
+		t.Error("NvLink.Supported = false although v1 enumerated links")
+	}
+	// 12 real links plus the one that failed for a real reason; the six
+	// phantom indices v1 always emitted are gone.
+	if got := len(g.NvLink.Links); got != 13 {
+		t.Fatalf("got %d links, want 13", got)
+	}
+	for _, link := range g.NvLink.Links {
+		switch {
+		case link.LinkIndex == 12:
+			if link.Error == "" {
+				t.Error("the genuinely broken link lost its error")
+			}
+		case link.Error != "":
+			t.Errorf("link %d: Error = %q, want empty", link.LinkIndex, link.Error)
+		}
+	}
+}
+
+// v1SampleLinks reproduces what a v1 exporter shipped for an A100: 12 real
+// links whose counters NVML declines, one link that failed to read for a real
+// reason, and five indices the card does not have.
+func v1SampleLinks() []v1.NvLinkState {
+	links := make([]v1.NvLinkState, 0, 18)
+	for i := 0; i < 12; i++ {
+		links = append(links, v1.NvLinkState{
+			LinkIndex: i, State: "Inactive",
+			Errors:      map[int]uint64{},
+			ErrorsDelta: map[int]int64{},
+			Error:       "GetNvLinkErrorCounter 4 error: Not Supported",
+		})
+	}
+	links = append(links, v1.NvLinkState{
+		LinkIndex: 12,
+		Errors:    map[int]uint64{}, ErrorsDelta: map[int]int64{},
+		Error: "GetNvLinkState error: Unknown Error",
+	})
+	for i := 13; i < 18; i++ {
+		links = append(links, v1.NvLinkState{
+			LinkIndex: i,
+			Errors:    map[int]uint64{}, ErrorsDelta: map[int]int64{},
+			Error: "GetNvLinkState error: Not Supported",
+		})
+	}
+	return links
+}
+
+// TestUpconvertV1ECCUnreadable: v1 had no ecc_info.error, so a failed
+// GetEccMode left the whole block zero. An empty mode is the only trace, and it
+// must not upconvert into a claim that ECC state was read.
+func TestUpconvertV1ECCUnreadable(t *testing.T) {
+	m1 := &v1.GpuMetrics{Gpus: []v1.GPUInfo{{Index: 0}}}
+
+	g := upconvertV1(m1).Gpus[0]
+
+	if g.ECC.Supported {
+		t.Error("ECC.Supported = true although v1 reported no ECC mode at all")
+	}
+}

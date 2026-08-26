@@ -438,13 +438,23 @@ func (e *GpuMetricsExporter) collectClocksThrottleInfo(device nvml.Device, info 
 	}
 }
 
-// collectECCInfo collects GPU ECC information and errors (enhanced)
+// collectECCInfo collects the GPU's ECC mode, error counters and retired pages.
+//
+// NOT_SUPPORTED from GetEccMode is a card without ECC, not a fault, and leaves
+// Supported false with no error. Any other failure is recorded: it used to be a
+// bare return, which on the host was indistinguishable from ECC switched off.
 func (e *GpuMetricsExporter) collectECCInfo(device nvml.Device, gpuID string, info *gpumetrics.GPUInfo) {
 	currentMode, pendingMode, ret := device.GetEccMode()
-	if ret != nvml.SUCCESS {
+	switch ret {
+	case nvml.SUCCESS:
+	case nvml.ERROR_NOT_SUPPORTED:
+		return
+	default:
+		info.ECC.Error = fmt.Sprintf("device.GetEccMode error: %s", nvml.ErrorString(ret))
 		return
 	}
 
+	info.ECC.Supported = true
 	info.ECC.Enabled = currentMode == 1
 	info.ECC.Pending = pendingMode == 1
 
@@ -469,7 +479,11 @@ func getValueDelta(newValue uint64, oldValue uint64) int64 {
 	}
 }
 
-// More detailed retired pages collection
+// collectRetiredPages collects the GPU's retired-page counts.
+//
+// Ampere and later replaced page retirement with row remapping and report none
+// of the FI_DEV_RETIRED_* fields, so Supported false with no error is the
+// normal answer across the modern fleet — read RowRemappingInfo there instead.
 func (e *GpuMetricsExporter) collectRetiredPages(device nvml.Device, gpuID string, eccInfo *gpumetrics.ECCInfo) {
 	fieldValues := []nvml.FieldValue{
 		{FieldId: nvml.FI_DEV_RETIRED_SBE},
@@ -477,100 +491,87 @@ func (e *GpuMetricsExporter) collectRetiredPages(device nvml.Device, gpuID strin
 		{FieldId: nvml.FI_DEV_RETIRED_PENDING},
 	}
 
-	if ret := device.GetFieldValues(fieldValues); ret == nvml.SUCCESS {
-		// GetFieldValues returns SUCCESS for the batch even when individual
-		// fields are unsupported; read each field's Value only when its own
-		// NvmlReturn is SUCCESS, otherwise the [8]byte is uninitialised and
-		// would feed garbage into the delta logic below.
-		got := 0
-		if fv := &fieldValues[0]; nvml.Return(fv.NvmlReturn) == nvml.SUCCESS {
-			eccInfo.RetiredPages.SBEPages = binary.LittleEndian.Uint64(fv.Value[:])
-			got++
-		}
-		if fv := &fieldValues[1]; nvml.Return(fv.NvmlReturn) == nvml.SUCCESS {
-			eccInfo.RetiredPages.DBEPages = binary.LittleEndian.Uint64(fv.Value[:])
-			got++
-		}
-		if fv := &fieldValues[2]; nvml.Return(fv.NvmlReturn) == nvml.SUCCESS {
-			eccInfo.RetiredPages.PendingPages = binary.LittleEndian.Uint64(fv.Value[:])
-			got++
-		}
-
-		if got == 0 {
-			eccInfo.RetiredPages.Error = "no retired-pages fields supported by NVML"
-		} else {
-			lastGpuInfo := e.findLastGpuInfo(gpuID)
-			if lastGpuInfo != nil {
-				eccInfo.RetiredPages.SBEPagesDelta = getValueDelta(eccInfo.RetiredPages.SBEPages, lastGpuInfo.ECC.RetiredPages.SBEPages)
-				eccInfo.RetiredPages.DBEPagesDelta = getValueDelta(eccInfo.RetiredPages.DBEPages, lastGpuInfo.ECC.RetiredPages.DBEPages)
-				eccInfo.RetiredPages.PendingPagesDelta = getValueDelta(eccInfo.RetiredPages.PendingPages, lastGpuInfo.ECC.RetiredPages.PendingPages)
-			}
-		}
-	} else {
+	switch ret := device.GetFieldValues(fieldValues); ret {
+	case nvml.SUCCESS:
+	case nvml.ERROR_NOT_SUPPORTED:
+		return
+	default:
 		eccInfo.RetiredPages.Error = fmt.Sprintf("GetFieldValues error: %s", nvml.ErrorString(ret))
+		return
+	}
+
+	// GetFieldValues returns SUCCESS for the batch even when individual
+	// fields are unsupported; read each field's Value only when its own
+	// NvmlReturn is SUCCESS, otherwise the [8]byte is uninitialised and
+	// would feed garbage into the delta logic below.
+	got := 0
+	if fv := &fieldValues[0]; nvml.Return(fv.NvmlReturn) == nvml.SUCCESS {
+		eccInfo.RetiredPages.SBEPages = binary.LittleEndian.Uint64(fv.Value[:])
+		got++
+	}
+	if fv := &fieldValues[1]; nvml.Return(fv.NvmlReturn) == nvml.SUCCESS {
+		eccInfo.RetiredPages.DBEPages = binary.LittleEndian.Uint64(fv.Value[:])
+		got++
+	}
+	if fv := &fieldValues[2]; nvml.Return(fv.NvmlReturn) == nvml.SUCCESS {
+		eccInfo.RetiredPages.PendingPages = binary.LittleEndian.Uint64(fv.Value[:])
+		got++
+	}
+
+	if got == 0 {
+		return
+	}
+
+	eccInfo.RetiredPages.Supported = true
+
+	lastGpuInfo := e.findLastGpuInfo(gpuID)
+	if lastGpuInfo != nil {
+		eccInfo.RetiredPages.SBEPagesDelta = getValueDelta(eccInfo.RetiredPages.SBEPages, lastGpuInfo.ECC.RetiredPages.SBEPages)
+		eccInfo.RetiredPages.DBEPagesDelta = getValueDelta(eccInfo.RetiredPages.DBEPages, lastGpuInfo.ECC.RetiredPages.DBEPages)
+		eccInfo.RetiredPages.PendingPagesDelta = getValueDelta(eccInfo.RetiredPages.PendingPages, lastGpuInfo.ECC.RetiredPages.PendingPages)
 	}
 }
 
-// collectECCErrors collects ECC error counts (both volatile and aggregate)
+// collectECCErrorsInternal fills the volatile and aggregate ECC counters for
+// one memory location.
+//
+// NOT_SUPPORTED is not a failure here: a MIG-enabled GPU declines the whole
+// volatile scope that way while still serving the aggregate one, which is why
+// Supported lives on the scope rather than on the GPU.
 func (e *GpuMetricsExporter) collectECCErrorsInternal(device nvml.Device, memoryLocation nvml.MemoryLocation, result *gpumetrics.ECCErrorsCounters) {
-	// Device Memory (DRAM) - Volatile correctable errors (since last reset)
-	errors, ret := device.GetMemoryErrorCounter(
-		nvml.MEMORY_ERROR_TYPE_CORRECTED,
-		nvml.VOLATILE_ECC,
-		memoryLocation,
-	)
-	if ret == nvml.SUCCESS {
-		result.Volatile.Correctable = errors
-	} else {
-		e.log.Warn("Failed to get volatile ECC Correctable",
-			zap.String("error", nvml.ErrorString(ret)), zap.Int32("memoryLocation", int32(memoryLocation)))
-
-		result.Volatile.Error = fmt.Sprintf("failed to get volatile ECC correctable: %s", nvml.ErrorString(ret))
+	queries := []struct {
+		scope     *gpumetrics.ECCErrors
+		dst       *uint64
+		errorType nvml.MemoryErrorType
+		counter   nvml.EccCounterType
+		what      string
+	}{
+		{&result.Volatile, &result.Volatile.Correctable, nvml.MEMORY_ERROR_TYPE_CORRECTED, nvml.VOLATILE_ECC, "volatile ECC correctable"},
+		{&result.Volatile, &result.Volatile.Uncorrectable, nvml.MEMORY_ERROR_TYPE_UNCORRECTED, nvml.VOLATILE_ECC, "volatile ECC uncorrectable"},
+		{&result.Aggregate, &result.Aggregate.Correctable, nvml.MEMORY_ERROR_TYPE_CORRECTED, nvml.AGGREGATE_ECC, "aggregate ECC correctable"},
+		{&result.Aggregate, &result.Aggregate.Uncorrectable, nvml.MEMORY_ERROR_TYPE_UNCORRECTED, nvml.AGGREGATE_ECC, "aggregate ECC uncorrectable"},
 	}
 
-	// Device Memory (DRAM) - Aggregate correctable errors (lifetime)
-	errors, ret = device.GetMemoryErrorCounter(
-		nvml.MEMORY_ERROR_TYPE_CORRECTED,
-		nvml.AGGREGATE_ECC,
-		memoryLocation,
-	)
-	if ret == nvml.SUCCESS {
-		result.Aggregate.Correctable = errors
-	} else {
-		e.log.Warn("Failed to get aggregate ECC Correctable",
-			zap.String("error", nvml.ErrorString(ret)), zap.Int32("memoryLocation", int32(memoryLocation)))
+	for _, q := range queries {
+		errors, ret := device.GetMemoryErrorCounter(q.errorType, q.counter, memoryLocation)
+		switch ret {
+		case nvml.SUCCESS:
+			*q.dst = errors
+			q.scope.Supported = true
+		case nvml.ERROR_NOT_SUPPORTED:
+		default:
+			e.log.Warn("Failed to get ECC counter",
+				zap.String("counter", q.what),
+				zap.String("error", nvml.ErrorString(ret)),
+				zap.Int32("memoryLocation", int32(memoryLocation)))
 
-		result.Aggregate.Error = fmt.Sprintf("failed to get aggregate ECC correctable: %s", nvml.ErrorString(ret))
-	}
-
-	// Device Memory (DRAM) - Volatile uncorrectable errors
-	errors, ret = device.GetMemoryErrorCounter(
-		nvml.MEMORY_ERROR_TYPE_UNCORRECTED,
-		nvml.VOLATILE_ECC,
-		memoryLocation,
-	)
-	if ret == nvml.SUCCESS {
-		result.Volatile.Uncorrectable = errors
-	} else {
-		e.log.Warn("Failed to get volatile ECC Uncorrectable",
-			zap.String("error", nvml.ErrorString(ret)), zap.Int32("memoryLocation", int32(memoryLocation)))
-
-		result.Volatile.Error = fmt.Sprintf("failed to get volatile ECC uncorrectable: %s", nvml.ErrorString(ret))
-	}
-
-	// Device Memory (DRAM) - Aggregate uncorrectable errors (lifetime)
-	errors, ret = device.GetMemoryErrorCounter(
-		nvml.MEMORY_ERROR_TYPE_UNCORRECTED,
-		nvml.AGGREGATE_ECC,
-		memoryLocation,
-	)
-	if ret == nvml.SUCCESS {
-		result.Aggregate.Uncorrectable = errors
-	} else {
-		e.log.Warn("Failed to get aggregate ECC Uncorrectable",
-			zap.String("error", nvml.ErrorString(ret)), zap.Int32("memoryLocation", int32(memoryLocation)))
-
-		result.Aggregate.Error = fmt.Sprintf("failed to get aggregate ECC uncorrectable: %s", nvml.ErrorString(ret))
+			// First failure in the scope wins. Each of the four queries used to
+			// overwrite the previous one's message, so only the last was ever
+			// visible — the same trap the NVLink counters had.
+			if q.scope.Error == "" {
+				q.scope.Error = fmt.Sprintf("failed to get %s: %s", q.what, nvml.ErrorString(ret))
+			}
+		}
 	}
 }
 
@@ -612,15 +613,23 @@ func (e *GpuMetricsExporter) collectECCErrors(device nvml.Device, gpuID string, 
 	}
 }
 
-// collectRowRemappingInfo collects GPU row remapping information
+// collectRowRemappingInfo collects GPU row remapping information.
 // GetRemappedRows returns: corrRows, uncRows, isPending, failureOccurred, ret
+//
+// Pre-Ampere GPUs retire pages instead of remapping rows and answer
+// NOT_SUPPORTED, which leaves Supported false without recording an error.
 func (e *GpuMetricsExporter) collectRowRemappingInfo(device nvml.Device, gpuID string, info *gpumetrics.GPUInfo) {
 	corrRows, uncRows, isPending, failureOccurred, ret := device.GetRemappedRows()
-	if ret != nvml.SUCCESS {
+	switch ret {
+	case nvml.SUCCESS:
+	case nvml.ERROR_NOT_SUPPORTED:
+		return
+	default:
 		info.RowRemapping.Error = fmt.Sprintf("device.GetRemappedRows error: %s", nvml.ErrorString(ret))
 		return
 	}
 
+	info.RowRemapping.Supported = true
 	info.RowRemapping.Correctable = uint64(corrRows)
 	info.RowRemapping.Uncorrectable = uint64(uncRows)
 	info.RowRemapping.Pending = isPending
@@ -633,49 +642,96 @@ func (e *GpuMetricsExporter) collectRowRemappingInfo(device nvml.Device, gpuID s
 	}
 }
 
-// collectNvLinkInfo collects NVLink information
+// findLastNvLinkState returns the previous tick's state for one NVLink link, or
+// nil if that link was not reported then.
+//
+// It matches on LinkIndex rather than on position in the slice. Now that links
+// the GPU does not have are skipped, the two are no longer the same number, and
+// indexing by position would diff a link against a different link's counters.
+func findLastNvLinkState(lastGpuInfo *gpumetrics.GPUInfo, linkIndex int) *gpumetrics.NvLinkState {
+	if lastGpuInfo == nil {
+		return nil
+	}
+
+	for i := range lastGpuInfo.NvLink.Links {
+		if lastGpuInfo.NvLink.Links[i].LinkIndex == linkIndex {
+			return &lastGpuInfo.NvLink.Links[i]
+		}
+	}
+
+	return nil
+}
+
+// collectNvLinkInfo enumerates the GPU's NVLink links and their error counters.
+//
+// NVLINK_MAX_LINKS is a header ceiling (18), not a link count: an A100 has 12
+// and a card with no NVLink has none. Indices the GPU does not have answer
+// NOT_SUPPORTED and are skipped rather than emitted, which is why entries carry
+// their real index in LinkIndex. Counters that answer NOT_SUPPORTED are left
+// out of Errors for the same reason — an inactive link reports none of them,
+// and that is not a fault worth an error string on every tick.
 func (e *GpuMetricsExporter) collectNvLinkInfo(device nvml.Device, gpuID string, info *gpumetrics.GPUInfo) {
 	nvLinkInfo := gpumetrics.NvLinkInfo{}
 
 	lastGpuInfo := e.findLastGpuInfo(gpuID)
 
-	// Try to get NVLink info - this may not be supported on all GPUs
 	for linkIndex := 0; linkIndex < nvml.NVLINK_MAX_LINKS; linkIndex++ {
-		linkState := gpumetrics.NvLinkState{LinkIndex: linkIndex, Errors: make(map[int]uint64), ErrorsDelta: make(map[int]int64)}
-
-		// Check if this link is active
 		state, ret := device.GetNvLinkState(linkIndex)
-		if ret == nvml.SUCCESS {
-			switch state {
-			case nvml.NVLINK_STATE_INACTIVE:
-				linkState.State = "Inactive"
-			case nvml.NVLINK_STATE_ACTIVE:
-				linkState.State = "Active"
-			case nvml.NVLINK_STATE_SLEEP:
-				linkState.State = "Sleep"
-			default:
-				linkState.State = "Unknown"
-			}
+		if ret == nvml.ERROR_NOT_SUPPORTED || ret == nvml.ERROR_INVALID_ARGUMENT {
+			// No such link on this GPU. Nothing to report.
+			continue
+		}
 
-			for errCounter := nvml.NVLINK_ERROR_DL_REPLAY; errCounter < nvml.NVLINK_ERROR_COUNT; errCounter++ {
-				value, ret := device.GetNvLinkErrorCounter(linkIndex, errCounter)
-				if ret == nvml.SUCCESS {
-					currValue := uint64(value)
-					linkState.Errors[int(errCounter)] = currValue
-					if lastGpuInfo != nil {
-						if linkIndex < len(lastGpuInfo.NvLink.Links) {
-							lastValue, ok := lastGpuInfo.NvLink.Links[linkIndex].Errors[int(errCounter)]
-							if ok {
-								linkState.ErrorsDelta[int(errCounter)] = getValueDelta(currValue, lastValue)
-							}
-						}
+		linkState := gpumetrics.NvLinkState{
+			LinkIndex:   linkIndex,
+			Errors:      make(map[int]uint64),
+			ErrorsDelta: make(map[int]int64),
+		}
+
+		if ret != nvml.SUCCESS {
+			// A link that exists but could not be read: keep the entry, that
+			// is the signal.
+			linkState.Error = fmt.Sprintf("GetNvLinkState error: %s", nvml.ErrorString(ret))
+			nvLinkInfo.Links = append(nvLinkInfo.Links, linkState)
+			continue
+		}
+
+		nvLinkInfo.Supported = true
+
+		switch state {
+		case nvml.NVLINK_STATE_INACTIVE:
+			linkState.State = "Inactive"
+		case nvml.NVLINK_STATE_ACTIVE:
+			linkState.State = "Active"
+		case nvml.NVLINK_STATE_SLEEP:
+			linkState.State = "Sleep"
+		default:
+			linkState.State = "Unknown"
+		}
+
+		lastLink := findLastNvLinkState(lastGpuInfo, linkIndex)
+
+		for errCounter := nvml.NVLINK_ERROR_DL_REPLAY; errCounter < nvml.NVLINK_ERROR_COUNT; errCounter++ {
+			value, ret := device.GetNvLinkErrorCounter(linkIndex, errCounter)
+			switch ret {
+			case nvml.SUCCESS:
+				linkState.Errors[int(errCounter)] = value
+				if lastLink != nil {
+					if lastValue, ok := lastLink.Errors[int(errCounter)]; ok {
+						linkState.ErrorsDelta[int(errCounter)] = getValueDelta(value, lastValue)
 					}
-				} else {
+				}
+			case nvml.ERROR_NOT_SUPPORTED:
+				// Absent from Errors already says the counter is unavailable.
+			default:
+				// First genuine failure wins: the five counters share one link,
+				// so a real fault reads the same on all of them and the old
+				// code's last-writer-wins left you reading "counter 4" while
+				// counters 0..3 had failed just as hard.
+				if linkState.Error == "" {
 					linkState.Error = fmt.Sprintf("GetNvLinkErrorCounter %d error: %s", errCounter, nvml.ErrorString(ret))
 				}
 			}
-		} else {
-			linkState.Error = fmt.Sprintf("GetNvLinkState error: %s", nvml.ErrorString(ret))
 		}
 
 		nvLinkInfo.Links = append(nvLinkInfo.Links, linkState)

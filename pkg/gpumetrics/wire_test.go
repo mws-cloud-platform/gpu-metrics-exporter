@@ -53,29 +53,30 @@ func sampleGpuMetrics() *GpuMetrics {
 			PerformanceState:      "P0",
 			PerformanceStateValue: 0,
 			ECC: ECCInfo{
-				Enabled: true, Pending: false, Mode: "Enabled",
+				Supported: true, Enabled: true, Pending: false, Mode: "Enabled",
 				DRAMErrors: ECCErrorsCounters{
-					Volatile:  ECCErrors{Correctable: 10, Uncorrectable: 1, CorrectableDelta: 2, UncorrectableDelta: 1},
-					Aggregate: ECCErrors{Correctable: 100, Uncorrectable: 5, CorrectableDelta: 0, UncorrectableDelta: 0},
+					Volatile:  ECCErrors{Supported: true, Correctable: 10, Uncorrectable: 1, CorrectableDelta: 2, UncorrectableDelta: 1},
+					Aggregate: ECCErrors{Supported: true, Correctable: 100, Uncorrectable: 5, CorrectableDelta: 0, UncorrectableDelta: 0},
 				},
 				SRAMErrors: ECCErrorsCounters{
-					Volatile:  ECCErrors{Correctable: 3, Uncorrectable: 0, CorrectableDelta: 3, UncorrectableDelta: 0},
-					Aggregate: ECCErrors{Correctable: 9, Uncorrectable: 0, CorrectableDelta: 0, UncorrectableDelta: 0},
+					Volatile:  ECCErrors{Supported: false, Correctable: 3, Uncorrectable: 0, CorrectableDelta: 3, UncorrectableDelta: 0},
+					Aggregate: ECCErrors{Supported: true, Correctable: 9, Uncorrectable: 0, CorrectableDelta: 0, UncorrectableDelta: 0},
 				},
 				RetiredPages: RetiredPagesInfo{
-					SBEPages: 2, DBEPages: 0, SBEPagesDelta: 1, DBEPagesDelta: 0,
+					Supported: true,
+					SBEPages:  2, DBEPages: 0, SBEPagesDelta: 1, DBEPagesDelta: 0,
 					PendingPages: 0, PendingPagesDelta: 0, Error: "",
 				},
 			},
 			RowRemapping: RowRemappingInfo{
-				Pending: false, Failed: false,
+				Supported: true, Pending: false, Failed: false,
 				Correctable: 4, Uncorrectable: 0, CorrectableDelta: 1, UncorrectableDelta: 0,
 			},
 			ClocksThrottle: ClocksThrottleInfo{
 				ThrottleReasons: 0, ThrottleReasonsStr: "None",
 				EventReasons: 0, EventReasonsStr: "None",
 			},
-			NvLink: NvLinkInfo{Links: []NvLinkState{
+			NvLink: NvLinkInfo{Supported: true, Links: []NvLinkState{
 				{
 					LinkIndex: 0, State: "Active",
 					Errors:      map[int]uint64{0: 5, 1: 7},

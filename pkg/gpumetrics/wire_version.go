@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"strings"
 
 	v1 "go.mws.cloud/gpu-metrics-exporter/pkg/gpumetrics/v1"
 )
@@ -24,7 +25,11 @@ import (
 //	     keys tx_throughtput/rx_throughtput.
 //	v2 — renames those to tx_throughput/rx_throughput (the break that forces
 //	     this versioning), and adds gpu_info[].mig_info and
-//	     xid_errors.dropped_count.
+//	     xid_errors.dropped_count. Splits "NVML does not report this" out of the
+//	     error strings into a supported flag on ecc_info, its volatile/aggregate
+//	     counters, retired_pages, row_remapping_info and nvlink_info, adds
+//	     ecc_info.error, and stops emitting nvlink_info.links entries for link
+//	     indices the GPU does not have.
 const CurrentWireVersion = 2
 
 // wireEnvelope is decoded first, to learn which full struct to decode into.
@@ -108,6 +113,12 @@ func gunzip(data []byte) ([]byte, error) {
 // Fields v1 has no notion of (MIG, XIDErrors.DroppedCount) are left zero, and
 // WireVersion stays 1 to say so: those zeros mean "not reported by this
 // exporter", not "reported as zero".
+//
+// The supported flags are the other half of the job. v1 wrote every non-SUCCESS
+// NVML return into an error string, so "this GPU has no row remapping" and "the
+// row-remapping query broke" arrived as the same kind of value. Splitting them
+// here means a consumer sees one shape from every exporter and never has to
+// match on an error substring itself.
 func upconvertV1(m1 *v1.GpuMetrics) *GpuMetrics {
 	m := &GpuMetrics{
 		WireVersion: 1,
@@ -190,38 +201,132 @@ func upconvertV1GPUInfo(g1 *v1.GPUInfo) GPUInfo {
 	}
 
 	g.ECC = ECCInfo{
+		// v1 had no ecc_info.error: a failed GetEccMode left the whole block
+		// zero, mode included, so a non-empty Mode is exactly the case where
+		// the query answered.
+		Supported:    g1.ECC.Mode != "",
 		Enabled:      g1.ECC.Enabled,
 		Pending:      g1.ECC.Pending,
 		Mode:         g1.ECC.Mode,
 		DRAMErrors:   upconvertV1ECCCounters(&g1.ECC.DRAMErrors),
 		SRAMErrors:   upconvertV1ECCCounters(&g1.ECC.SRAMErrors),
-		RetiredPages: RetiredPagesInfo(g1.ECC.RetiredPages),
+		RetiredPages: upconvertV1RetiredPages(&g1.ECC.RetiredPages),
 	}
-	g.RowRemapping = RowRemappingInfo(g1.RowRemapping)
 
-	if g1.NvLink.Links != nil {
-		links := make([]NvLinkState, 0, len(g1.NvLink.Links))
-		for i := range g1.NvLink.Links {
-			l1 := &g1.NvLink.Links[i]
-			links = append(links, NvLinkState{
-				LinkIndex:   l1.LinkIndex,
-				State:       l1.State,
-				Errors:      l1.Errors,
-				ErrorsDelta: l1.ErrorsDelta,
-				Error:       l1.Error,
-			})
-		}
-		g.NvLink = NvLinkInfo{Links: links}
+	rowSupported, rowErr := splitV1Error(g1.RowRemapping.Error)
+	g.RowRemapping = RowRemappingInfo{
+		Supported:          rowSupported,
+		Pending:            g1.RowRemapping.Pending,
+		Failed:             g1.RowRemapping.Failed,
+		Correctable:        g1.RowRemapping.Correctable,
+		Uncorrectable:      g1.RowRemapping.Uncorrectable,
+		CorrectableDelta:   g1.RowRemapping.CorrectableDelta,
+		UncorrectableDelta: g1.RowRemapping.UncorrectableDelta,
+		Error:              rowErr,
 	}
+
+	g.NvLink = upconvertV1NvLink(&g1.NvLink)
 
 	return g
 }
 
+// upconvertV1RetiredPages maps v1's retired-page counts into the current shape.
+//
+// Supported is always false, and deliberately so. v1's collector read the field
+// batch without checking each field's own NvmlReturn, so on a GPU supporting
+// none of them — every Ampere and later card — it reported an empty error and
+// three counts decoded from uninitialised bytes. Nothing in the payload
+// separates that from a real reading, so the receiver carries the numbers
+// through without blessing them; WireVersion == 1 is what says why.
+func upconvertV1RetiredPages(r1 *v1.RetiredPagesInfo) RetiredPagesInfo {
+	_, errStr := splitV1Error(r1.Error)
+
+	return RetiredPagesInfo{
+		Supported:         false,
+		SBEPages:          r1.SBEPages,
+		DBEPages:          r1.DBEPages,
+		SBEPagesDelta:     r1.SBEPagesDelta,
+		DBEPagesDelta:     r1.DBEPagesDelta,
+		PendingPages:      r1.PendingPages,
+		PendingPagesDelta: r1.PendingPagesDelta,
+		Error:             errStr,
+	}
+}
+
+// upconvertV1NvLink maps v1's NVLink block into the current shape, dropping the
+// entries for link indices the GPU does not have.
+//
+// v1 emitted one entry per possible link index, so an A100 shipped its 12 real
+// links plus 6 carrying nothing but "GetNvLinkState error: Not Supported".
+// Dropping them here is what lets a consumer read links[] the same way whatever
+// exporter sent it. A link whose state failed to read for any other reason is a
+// genuine fault and is kept.
+func upconvertV1NvLink(n1 *v1.NvLinkInfo) NvLinkInfo {
+	if n1.Links == nil {
+		return NvLinkInfo{}
+	}
+
+	info := NvLinkInfo{Links: make([]NvLinkState, 0, len(n1.Links))}
+	for i := range n1.Links {
+		l1 := &n1.Links[i]
+		supported, linkErr := splitV1Error(l1.Error)
+
+		// An empty state means GetNvLinkState itself failed; NOT_SUPPORTED
+		// there means the link does not exist.
+		if l1.State == "" && !supported {
+			continue
+		}
+		if l1.State != "" {
+			info.Supported = true
+		}
+
+		info.Links = append(info.Links, NvLinkState{
+			LinkIndex:   l1.LinkIndex,
+			State:       l1.State,
+			Errors:      l1.Errors,
+			ErrorsDelta: l1.ErrorsDelta,
+			Error:       linkErr,
+		})
+	}
+
+	return info
+}
+
 func upconvertV1ECCCounters(c1 *v1.ECCErrorsCounters) ECCErrorsCounters {
 	return ECCErrorsCounters{
-		Volatile:  ECCErrors(c1.Volatile),
-		Aggregate: ECCErrors(c1.Aggregate),
+		Volatile:  upconvertV1ECCErrors(&c1.Volatile),
+		Aggregate: upconvertV1ECCErrors(&c1.Aggregate),
 	}
+}
+
+func upconvertV1ECCErrors(e1 *v1.ECCErrors) ECCErrors {
+	supported, errStr := splitV1Error(e1.Error)
+
+	return ECCErrors{
+		Supported:          supported,
+		Correctable:        e1.Correctable,
+		Uncorrectable:      e1.Uncorrectable,
+		CorrectableDelta:   e1.CorrectableDelta,
+		UncorrectableDelta: e1.UncorrectableDelta,
+		Error:              errStr,
+	}
+}
+
+// splitV1Error maps a v1 error string onto the current supported/error split:
+// NVML's NOT_SUPPORTED answer becomes supported=false with no error, anything
+// else stays an error on a facet assumed supported.
+//
+// The v1 exporter built these strings by wrapping nvml.ErrorString in its own
+// fmt.Sprintf calls, and both that code and the v1 structs are frozen, so
+// matching the substring is stable — it can never have to cover a string a
+// future exporter invents. An empty error means the query answered, which is
+// itself proof of support.
+func splitV1Error(errStr string) (supported bool, remaining string) {
+	if strings.Contains(errStr, "Not Supported") {
+		return false, ""
+	}
+
+	return true, errStr
 }
 
 // compressRaw gzips already-marshalled JSON. Used by tests to build a payload
