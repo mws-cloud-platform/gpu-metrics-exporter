@@ -62,6 +62,36 @@ Rules when changing the format:
 
 `TestUpconvertV1LosesNothing` reflectively fills every v1 field, flattens both sides to json paths, and asserts each one survives — so a field forgotten in an upconverter fails the build instead of silently arriving as zero. `testdata/v1_payload.json` is a readable golden fixture of a real v1 payload.
 
+#### Procedure: bumping the wire version
+
+Follow this in order. The failure mode throughout is *silent*: a mistake here doesn't crash, it makes a field decode as a plausible zero on the host.
+
+1. **Check a bump is actually needed.** Adding fields is not a bump — old receivers ignore unknown keys, new receivers read absent ones as zero. Bump only for a rename, a type change, a unit/semantic change, or restructured nesting.
+
+2. **Freeze the outgoing structs — generate, never hand-copy.** Extract from the last released tag (or the commit that shipped it) into `pkg/gpumetrics/vN/`, keeping only the type declarations:
+   ```bash
+   git show <tag>:pkg/gpumetrics/metrics.go > /tmp/vN.go   # then strip funcs, set `package vN`
+   ```
+   Copying ~250 lines by hand is how a wrong json tag gets in, and the test suite cannot catch a tag that was wrong from the start.
+
+3. **Verify the snapshot field-for-field against its source.** Compare the sorted `json:"…"` tags *and* the (field name, Go type, tag) triples between the tag's file and the new frozen package; both sets must be identical. Confirm the frozen package still contains that version's quirks (e.g. `tx_throughtput`) and lacks anything newer.
+
+4. **Make the format change** in `pkg/gpumetrics/metrics.go`.
+
+5. **Bump `CurrentWireVersion`** in `wire_version.go` and add a row to the version-history comment above it saying what changed and why.
+
+6. **Add the dispatch case** in `NewGpuMetricsFromBytes`. Leave the `default` branch decoding optimistically — never turn a newer-than-us payload into a hard error.
+
+7. **Add `upconvertVN`, and chain adjacent versions.** Today `upconvertV1` maps straight to current because there are only two versions. At three, refactor so each upconverter targets the *next* version (`v1→v2`, `v2→v3`) and chain them — otherwise every new version needs a new direct mapping from every old one. Set `WireVersion` to the version actually received, not the current one.
+
+8. **Extend `v1ToV2KeyRenames`** (rename it per version) in `wire_version_test.go` with any renamed json path. The completeness test fails loudly on an unlisted rename, which is the intended behaviour — do not "fix" it by deleting the assertion.
+
+9. **Add a golden fixture** `testdata/vN_payload.json` for the version being frozen, as readable JSON, and a test decoding it. Fixtures are what pin the bytes real guests send.
+
+10. **Update the version table in `README.md`** and run `make docker-test`.
+
+**Sanity-check the completeness test still bites.** Delete one field from an upconverter, confirm `TestUpconvertV1LosesNothing` fails, restore it. A completeness test that has quietly stopped covering anything is worse than none, because it licenses the assumption that mappings are checked.
+
 ### Vsock I/O (`pkg/vsock`)
 `server.VsockListener` creates a non-blocking AF_VSOCK SOCK_STREAM socket bound to `VMADDR_CID_ANY`, and `Accept` polls (100 ms timeout) so `ctx.Done()` / `Close()` can interrupt it — the receiver uses context cancellation + `Close()` for shutdown. `client.NewClientConnection` connects to `VMADDR_CID_HOST` (CID 2). The exporter opens a **fresh connection per send** (connect → SendData → send empty close-frame → Close); there is no persistent connection.
 
