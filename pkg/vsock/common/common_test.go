@@ -10,7 +10,24 @@ import (
 	"time"
 
 	"github.com/cespare/xxhash/v2"
+	"golang.org/x/sys/unix"
 )
+
+// newSocketpairConns builds a VsockConn pair from an AF_UNIX socketpair. Unlike
+// os.Pipe, an AF_UNIX socket supports SO_RCVTIMEO, which the read-deadline path
+// relies on, so deadline tests must use a socketpair rather than newPipeConns.
+func newSocketpairConns(t *testing.T) (a, b *VsockConn) {
+	t.Helper()
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	if err != nil {
+		t.Fatalf("unix.Socketpair: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = unix.Close(fds[0])
+		_ = unix.Close(fds[1])
+	})
+	return NewVsockConn(fds[0]), NewVsockConn(fds[1])
+}
 
 // newPipeConns returns a sender/receiver VsockConn pair backed by an os.Pipe.
 // VsockConn speaks raw fd I/O (unix.Read/unix.Write), so a pipe exercises the
@@ -299,5 +316,45 @@ func TestVsockAddrString(t *testing.T) {
 	}
 	if a.Network() != "vsock" {
 		t.Fatalf("Network = %q, want %q", a.Network(), "vsock")
+	}
+}
+
+// TestReadDeadlineExceeded verifies that a blocked read on a stalled peer
+// surfaces os.ErrDeadlineExceeded instead of hanging forever. This is the guard
+// against a guest that opens a connection, sends a header, and then goes
+// silent: without an enforced read deadline the serving goroutine and its fd
+// would be pinned until process shutdown.
+func TestReadDeadlineExceeded(t *testing.T) {
+	sender, receiver := newSocketpairConns(t)
+	_ = sender // nothing is sent: the receiver must time out
+
+	// Tight deadline; generous check window relative to it.
+	_ = receiver.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := receiver.RecvData()
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("expected os.ErrDeadlineExceeded, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("RecvData did not return within timeout; read deadline not enforced")
+	}
+}
+
+// TestReadDeadlineExpiredBeforeRead verifies the already-expired branch: a
+// deadline in the past returns immediately without touching the socket.
+func TestReadDeadlineExpiredBeforeRead(t *testing.T) {
+	_, receiver := newSocketpairConns(t)
+	_ = receiver.SetReadDeadline(time.Now().Add(-time.Second))
+
+	_, err := receiver.RecvData()
+	if !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("expected os.ErrDeadlineExceeded, got %v", err)
 	}
 }

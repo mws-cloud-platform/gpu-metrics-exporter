@@ -1,0 +1,123 @@
+{
+  "source": {
+    "vsock_client_id": 0,
+    "instance_id": "i-legacy-guest"
+  },
+  "exporter_info": {
+    "seqno": 4211,
+    "timestamp": 1785600000,
+    "version": "2026.07.29-1",
+    "start_time": 1785500000,
+    "init_nvml_error": "",
+    "get_device_count_error": "",
+    "read_instance_id_error": "",
+    "send_metrics_error_count": 0,
+    "send_metrics_last_error": ""
+  },
+  "nv_fabric_manager_status": {
+    "active": true,
+    "enabled": true,
+    "not_degraded": true
+  },
+  "xid_errors": {
+    "error": "",
+    "xid_errors": [
+      "NVRM: Xid (PCI:0000:01:00): 79, pid=1234, GPU has fallen off the bus."
+    ]
+  },
+  "gpu_device_count": 1,
+  "gpu_info": [
+    {
+      "index": 0,
+      "error": "",
+      "uuid": "GPU-11111111-2222-3333-4444-555555555555",
+      "name": "NVIDIA A100-SXM4-40GB",
+      "serial": "0321918123456",
+      "temperature_celsius": 47,
+      "memory_temperature_celsius": 52,
+      "power_usage_watts": 312,
+      "power_limit_watts": 400,
+      "memory_total_bytes": 42949672960,
+      "memory_used_bytes": 1073741824,
+      "memory_free_bytes": 41875931136,
+      "bar1_memory_total_bytes": 34359738368,
+      "bar1_memory_used_bytes": 5242880,
+      "bar1_memory_free_bytes": 34354495488,
+      "utilization": { "gpu_percent": 87, "memory_percent": 41 },
+      "decoder_utilization_percent": 0,
+      "encoder_utilization_percent": 0,
+      "clocks": { "graphics_mhz": 1410, "memory_mhz": 1215, "sm_mhz": 1410 },
+      "fan_speed_percent": 0,
+      "pci_info": {
+        "bus_id": "00000000:01:00.0",
+        "domain": 0,
+        "bus": 1,
+        "device": 0,
+        "pci_generation": 4,
+        "link_width_current": 16,
+        "max_pci_generation": 4,
+        "max_link_width": 16,
+        "tx_throughtput": 9876,
+        "rx_throughtput": 5432
+      },
+      "driver_model": "",
+      "driver_version": "535.129.03",
+      "vbios_version": "92.00.45.00.03",
+      "compute_mode": "Default",
+      "compute_mode_value": 0,
+      "performance_state": "P0",
+      "performance_state_value": 0,
+      "ecc_info": {
+        "enabled": true,
+        "pending": false,
+        "mode": "Enabled",
+        "dram_errors": {
+          "volatile":  { "correctable": 12, "uncorrectable": 0, "correctable_delta": 2, "uncorrectable_delta": 0, "error": "" },
+          "aggregate": { "correctable": 480, "uncorrectable": 1, "correctable_delta": 0, "uncorrectable_delta": 0, "error": "" }
+        },
+        "sram_errors": {
+          "volatile":  { "correctable": 0, "uncorrectable": 0, "correctable_delta": 0, "uncorrectable_delta": 0, "error": "" },
+          "aggregate": { "correctable": 3, "uncorrectable": 0, "correctable_delta": 0, "uncorrectable_delta": 0, "error": "" }
+        },
+        "retired_pages": {
+          "sbe_pages": 4,
+          "dbe_pages": 1,
+          "sbe_pages_delta": 0,
+          "dbe_pages_delta": 1,
+          "pending_pages": 1,
+          "pending_pages_delta": 1,
+          "error": ""
+        }
+      },
+      "row_remapping_info": {
+        "correctable_rows": 2,
+        "uncorrectable_rows": 0,
+        "correctable_rows_delta": 0,
+        "uncorrectable_rows_delta": 0,
+        "is_pending": false,
+        "failure_occurred": false,
+        "error": ""
+      },
+      "clocks_throttle_info": {
+        "throttle_reasons": 1,
+        "throttle_reasons_string": "GpuIdle",
+        "event_reasons": 0,
+        "event_reasons_string": "None"
+      },
+      "nvlink_info": {
+        "links": [
+          {
+            "index": 0,
+            "state": "Active",
+            "errors": { "0": 3, "1": 0 },
+            "errors_delta": { "0": 1, "1": 0 },
+            "error": ""
+          }
+        ]
+      },
+      "architecture": "Ampere",
+      "cuda_compute_capability": { "major": 8, "minor": 0 },
+      "persistence_mode": 1
+    }
+  ]
+}

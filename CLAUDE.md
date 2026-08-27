@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 GPU metrics exporter ships NVIDIA GPU metrics from inside a guest VM to the host over **AF_VSOCK** sockets, for observability of MWS GPU VMs. It produces two Linux/amd64 binaries:
 
 - **`gpu-metrics-exporter`** (guest) — a vsock *client* that periodically queries GPU metrics via [go-nvml](https://github.com/NVIDIA/go-nvml) (and `nvidia-smi`/`dmesg`/`systemctl` shelling-out for a few things) and sends them to the host.
-- **`gpu-metrics-receiver`** (host) — a vsock *server* that accepts exporter connections, decodes metrics, and hands them to an injected `GpuMeticsConsumer`.
+- **`gpu-metrics-receiver`** (host) — a vsock *server* that accepts exporter connections, decodes metrics, and hands them to an injected `GpuMetricsConsumer`.
 
 Transport is raw AF_VSOCK (`golang.org/x/sys/unix`), *not* `net.Dial`. The host is always CID 2; each guest VM has a unique CID > 2. The receiver reads the peer CID (`metrics.Source.VsockClientID`) to identify the VM — downstream code is expected to map CID → VMID.
 
@@ -27,33 +27,117 @@ make clean
 
 Single test: `go test -v -run TestCompressDecompressRoundTrip ./pkg/gpumetrics/`
 
-**Build environment caveat:** the dev host is macOS (darwin), but the binaries target `GOOS=linux GOARCH=amd64`. The exporter requires `CGO_ENABLED=1` because go-nvml cgo-links to `libnvidia-ml`. Cross-compiling the exporter from macOS requires a Linux/amd64 C cross-toolchain; in practice use `make docker-build` (or `docker-test`). Native `make test` on darwin works for the pure-Go `pkg/gpumetrics` round-trip test but the build tags/no-libnvml situation means tests that touch NVML only run meaningfully on Linux. Prefer `make docker-test` for CI-equivalent runs.
+**Build environment caveat:** the dev host is macOS (darwin), but the binaries target `GOOS=linux GOARCH=amd64`. The exporter requires `CGO_ENABLED=1` because go-nvml cgo-links to `libnvidia-ml`. Cross-compiling the exporter from macOS needs a Linux/amd64 C cross-toolchain, so *building* means `make docker-build`.
+
+*Testing*, though, is not so restricted: `go test ./...` and `go vet ./...` pass natively on darwin for **all four** test packages (`pkg/gpumetrics`, `pkg/gpumetricsexporter`, `pkg/gpumetricsreceiver`, `pkg/vsock/common`). go-nvml dlopens `libnvidia-ml` rather than needing it at link time, and `golang.org/x/sys/unix` ships `SockaddrVM` plus most `VMADDR_*` constants for darwin. Keep it that way — the fast local loop depends on it, and `make vet` is a real check on this host.
 
 CI lives in `.github/workflows/build.yml` (GitHub Actions). On every branch push / pull request it runs the `binaries` job (`make docker-build`) and uploads the linux/amd64 binaries as a workflow artifact — nothing is published. On a tag push (tags look like `2026.06.08-2`) it runs the `debs` job: `make deb VERSION=<tag>` builds both `.deb`s into `dist/` and attaches them to a GitHub Release. The tag name is the package/binaries version. Both binaries expose a `version` string var set via ldflags (`-X main.version=…`, injected through the Dockerfile `VERSION` build-arg) and a `-version` flag. Module requires Go 1.25.0 (`go.mod`).
 
+## Testing
+
+- `go test ./...` on darwin is the fast loop; `make docker-test` is the CI-equivalent run and the one that must be green before committing. Some tests only execute under Linux (below), so a darwin-only pass is not sufficient evidence.
+- **Check platform availability before using a `unix.` constant in a test.** `golang.org/x/sys/unix` defines `VMADDR_CID_ANY`/`_HOST` on darwin but *not* `VMADDR_CID_LOCAL`, so a test touching vsock loopback must carry `//go:build linux` or it breaks the build on the dev host — which `make docker-test` alone will not reveal. `deadline_vsock_test.go` is the existing example.
+- **Collectors are unit-testable without GPU hardware.** `nvml.Device` is an interface and go-nvml ships `pkg/nvml/mock` with per-method function fields, so a `collect*` method can be driven through every NVML return path (`SUCCESS`, `ERROR_NOT_SUPPORTED`, `ERROR_NOT_FOUND`, failures) against a fake device. `mig_test.go` is the pattern to copy. There is no excuse for an untested collector.
+- Tests needing real AF_VSOCK use the loopback CID and **skip** (never fail) where the `vsock_loopback` module is absent, so they stay useful in CI without becoming a hard dependency.
+- When a test is written to catch a specific bug, verify it actually fails without the fix before committing — several tests here exist because a plausible-looking assertion turned out to assert nothing.
+
 ## Architecture
 
+### Trust model
+
+The guest VM is the untrusted side, and **customers have root in it**. Every field in a payload is therefore attacker-controlled, and no in-guest secret could change that: any key the exporter holds is readable by the VM's owner, so signing proves only "something inside the VM signed this".
+
+What *is* trustworthy is the peer CID: it comes from the kernel via `getpeername`, and the receiver overwrites `Source.VsockClientID` with it on every frame. That bounds the damage — a malicious guest can lie about itself but cannot impersonate another tenant.
+
+The trap to watch: `Source.InstanceID` sits next to that trustworthy CID in the same struct but is read from a file *inside the guest*, so it is fully forgeable. Never use it for identity, authorization, or billing attribution; the host's CID → VMID mapping is authoritative. More broadly, treat guest-reported XID/SXID as advisory — fabricating a hardware fault is the attack with an actual payoff (migrations, credits, ops churn), so it should not by itself trigger costly automated action without host-side corroboration.
+
 ### Two-goroutine pipeline in the exporter (`pkg/gpumetricsexporter`)
-`exporter.go` runs `queryMetricsLoop` (ticker-driven, every `TickPeriod` seconds, default 10) and `sendMetricsLoop` (separate goroutine, `wg`-tracked), connected by a buffered `metricsQueue` channel (cap 32). Decoupling query from send means a slow/blocked vsock send doesn't stall NVML collection. Stop is via two `stop*Chan` signaled from context (driven by SIGINT/SIGTERM in `main.go`). The query loop blocks on `metricsQueue <- m`; the send loop drains it.
+`exporter.go` runs `queryMetricsLoop` (ticker-driven, every `TickPeriod` seconds, default 10) and `sendMetricsLoop` (separate goroutine, `wg`-tracked), connected by a buffered `metricsQueue` channel (cap 32). Decoupling query from send means a slow/blocked vsock send doesn't stall NVML collection. Both loops stop on `ctx.Done()` (driven by SIGINT/SIGTERM in `main.go`). The query loop enqueues with a `select` on `metricsQueue <- m` **and** `ctx.Done()`, so a full queue behind a stalled send can still be interrupted; the send loop drains it.
 
 ### Per-tick collection (`query_metrics.go`)
 `queryMetrics()` builds one `gpumetrics.GpuMetrics` per tick: reads instance ID from `/var/lib/cloud/data/instance-id` (cloud-init), increments an atomic `seqno`, then for each GPU index runs `collectGPUInfo` — a sequence of ~20 `collect*` methods each pulling one NVML facet and silently no-oping on non-`nvml.SUCCESS` (unsupported features don't fail the whole tick). Also shells out to `systemctl` (nvidia-fabricmanager health) and `dmesg` (XID/SXID errors within the last `TickPeriod+10` sec).
 
+**`NOT_SUPPORTED` is not an error.** The facets that report their own health — `ecc_info` and its volatile/aggregate counters, `retired_pages`, `row_remapping_info`, `nvlink_info` — carry a `supported` bool next to `error`, and a collector must keep them apart: `ERROR_NOT_SUPPORTED` leaves `Supported` false with an *empty* error, any other failure sets the error. Writing NOT_SUPPORTED into the error string is what made a healthy A100 ship a dozen error strings per tick (a card has no retired pages past Ampere, no row remapping before it, no NVLink counters on an idle link, no volatile ECC counters under MIG) — and a field that is noisy on every healthy host is a field nobody reads when it finally says something. Zero values are only meaningful while `supported` is true. When adding a collector, follow this; when adding an error string, ask first whether it fires on healthy hardware.
+
+Where several NVML calls back one field pair, **the first genuine failure wins** rather than the last. Both the NVLink counter loop and the four ECC counter queries used to let each iteration overwrite the previous message, so a link whose five counters had all failed reported only "counter 4".
+
+**`GetFieldValues` needs a per-field status check.** It returns `SUCCESS` for the batch even when an individual field is unsupported, and each `nvml.FieldValue` carries its own `NvmlReturn`/`ValueType`. Reading `Value [8]byte` without checking `fv.NvmlReturn == nvml.SUCCESS` yields uninitialised bytes — which is how a bogus memory temperature, or a fabricated retired-page count feeding a false "retired pages grew" delta, gets onto the wire. Check each field, and decode with `binary.LittleEndian` rather than assembling bytes by hand.
+
+**MIG:** `collectMIGInfo` reports `GetMigMode`'s current *and* pending modes — they differ while a MIG change awaits a GPU reset, so a lone enabled bit would show a partitioning that is not actually running. When MIG is on it walks `0..GetMaxMigDeviceCount()`, treating `ERROR_NOT_FOUND` as an empty slot (indices are sparse — a partitioning leaves gaps) and keeping the real NVML index on each instance. `ERROR_NOT_SUPPORTED` from `GetMigMode` is the normal pre-Ampere case and leaves `Supported` false without recording an error; only a genuine failure sets `MIG.Error`. Note that a MIG-enabled GPU makes NVML answer `NOT_SUPPORTED` to many whole-device queries (utilization, volatile ECC, clocks), so those land as `0` — `mig_info.enabled` is what distinguishes that from an idle card.
+
+**NVLink:** `nvml.NVLINK_MAX_LINKS` is a header ceiling (18), not a link count — an A100 has 12 — so `collectNvLinkInfo` skips the indices NVML rejects with `NOT_SUPPORTED`/`INVALID_ARGUMENT` instead of emitting phantom entries, and each entry keeps its real `LinkIndex`. That makes slice position and link index different numbers: `findLastNvLinkState` matches on `LinkIndex`, and anything else reaching into `lastGpuInfo.NvLink.Links` must too, or a link gets diffed against another link's counters. A link that exists but fails to read for any other reason keeps its entry — that one is the signal.
+
 **Delta tracking:** the exporter keeps `lastMetrics` (RWMutex-guarded) and computes `*Delta` fields for ECC errors, retired pages, row remapping, and NVLink error counters via `getValueDelta` (monotonic: returns 0 if new ≤ old). `findLastGpuInfo(gpuID)` matches GPUs across ticks by UUID. When adding a new cumulative counter, follow this same last-vs-current delta pattern.
 
+`lastMetrics` is published at the end of `queryMetrics` — the baseline is the last **collected** snapshot, not the last **sent** one. That is deliberate: with a send-based baseline, several payloads backlogged in `metricsQueue` behind a slow send all diff against the same baseline, and a consumer summing `*_delta` double-counts. The trade-off is that a payload that fails to send takes its delta with it; the absolute counters ride on every payload, so consumers that cannot miss an increase should track those instead.
+
+**XID/SXID delivery:** `getXIDErrors` does not just report the current dmesg window. A line goes into `unsentXIDErrors` when first seen and is re-shipped on every payload until `sendMetrics` confirms delivery, so a failed send cannot drop an XID — the product's core signal. `retiredXIDErrors` (line → time it left the pending buffer) stops the overlapping dmesg window from re-admitting a line, and is pruned by age since dmesg lines carry timestamps and would otherwise accumulate forever. **A line is retired whether it was delivered or dropped** — a dropped line that is neither pending nor retired reads as fresh on the next tick, gets re-queued at the tail behind newer lines, and those newer lines get evicted in its place, inverting the oldest-first rule and re-counting the same line into `DroppedCount` every tick it thrashes. Both buffers are capped (`maxUnsentXIDErrors`, `maxRetiredXIDErrors`); overflow drops oldest-first and counts into `XIDErrors.DroppedCount` so loss is visible on the wire. The cap matters: an unbounded pending set grows the payload every tick the host is unreachable, and once the gzipped frame passes 64 KiB `SendData` fails on size permanently.
+
 ### Wire format (`pkg/gpumetrics` + `pkg/vsock/common`)
-`GpuMetrics.ToBytes()` → JSON → gzip. Over vsock each message is framed by `VsockFrameHeader{Magic 0xBEADBEAF, Len, xxhash64}` with a 64 KiB max payload (`SendData`/`RecvData` in `pkg/vsock/common/common.go`). An empty (Len=0) frame is the exporter's "I'm done, close" signal — the receiver treats `ErrNoData` as a clean end-of-stream and breaks out of the read loop. `metrics_test.go` only covers the gzip/JSON round-trip.
+`GpuMetrics.ToBytes()` → JSON → gzip. Over vsock each message is framed by `VsockFrameHeader{Magic 0xBEADBEAF, Len, xxhash64}` with a 64 KiB max payload (`SendData`/`RecvData` in `pkg/vsock/common/common.go`). An empty (Len=0) frame is the exporter's "I'm done, close" signal — the receiver treats `ErrNoData` as a clean end-of-stream and breaks out of the read loop. `wire_test.go` round-trips a fully-populated payload so a regression in any json tag shows up as a diff; `common_test.go` covers framing (short reads, truncation, hash mismatch, oversized frames).
+
+**Versioning (`wire_version.go`).** The payload carries `wire_version`; `CurrentWireVersion` is what this build writes. Because the exporter lives in a customer VM (root, may never upgrade) and the protocol is one-way, the receiver must decode every version ever shipped and all compatibility lives receiver-side. `NewGpuMetricsFromBytes` decodes a small `wireEnvelope` first, dispatches to the matching structs, and upconverts — **consumers always get the current shape and must never branch on version to read a field**. v1 (tag `2026.07.29-1`) predates the field, so absent (`0`) is read as 1; a version *above* current decodes optimistically as current rather than being dropped.
+
+Rules when changing the format:
+- Additive changes need no bump. Bump only for a rename, retype, unit change, or restructure — then freeze the old structs in `pkg/gpumetrics/vN/` (**never edit a frozen package**: it describes bytes already in the field) and add an upconverter to the chain.
+- A changed *encoding* can't be announced by a payload field — bump the frame `Magic` instead so old receivers fail loudly.
+- `ExporterInfo.Version` is a build ID, not a schema version; never dispatch on it.
+- The returned `WireVersion` is the version the *exporter* spoke. It's what separates "reported zero" from "too old to report" — a v1 payload has empty `mig_info` because v1 never collected it.
+
+**An upconverter may translate, not just copy.** v1 wrote every non-`SUCCESS` NVML return into an error string, so `splitV1Error` recovers the `supported` flag from it — NOT_SUPPORTED becomes `supported=false` with the error cleared, anything else stays an error. `upconvertV1NvLink` likewise drops the entries v1 emitted for link indices the GPU does not have. Doing it here is the point: the alternative is every consumer matching on an error substring forever. It is safe because both the v1 structs and the v1 exporter that produced those strings are frozen, so the set of strings to recognise can never grow. `retired_pages.supported` is the one thing v1 cannot settle either way — its collector read the field batch without checking each field's own status, so the counts are uninitialised bytes exactly where support was missing; the receiver carries the numbers through with `supported` false rather than blessing them.
+
+`TestUpconvertV1LosesNothing` reflectively fills every v1 field, flattens both sides to json paths, and asserts each one survives — so a field forgotten in an upconverter fails the build instead of silently arriving as zero. `testdata/v1_payload.json` is a readable golden fixture of a real v1 payload.
+
+#### Procedure: bumping the wire version
+
+Follow this in order. The failure mode throughout is *silent*: a mistake here doesn't crash, it makes a field decode as a plausible zero on the host.
+
+1. **Check a bump is actually needed.** Adding fields is not a bump — old receivers ignore unknown keys, new receivers read absent ones as zero. Bump only for a rename, a type change, a unit/semantic change, or restructured nesting.
+
+2. **Freeze the outgoing structs — generate, never hand-copy.** Extract from the last released tag (or the commit that shipped it) into `pkg/gpumetrics/vN/`, keeping only the type declarations:
+   ```bash
+   git show <tag>:pkg/gpumetrics/metrics.go > /tmp/vN.go   # then strip funcs, set `package vN`
+   ```
+   Copying ~250 lines by hand is how a wrong json tag gets in, and the test suite cannot catch a tag that was wrong from the start.
+
+3. **Verify the snapshot field-for-field against its source.** Compare the sorted `json:"…"` tags *and* the (field name, Go type, tag) triples between the tag's file and the new frozen package; both sets must be identical. Confirm the frozen package still contains that version's quirks (e.g. `tx_throughtput`) and lacks anything newer.
+
+4. **Make the format change** in `pkg/gpumetrics/metrics.go`.
+
+5. **Bump `CurrentWireVersion`** in `wire_version.go` and add a row to the version-history comment above it saying what changed and why.
+
+6. **Add the dispatch case** in `NewGpuMetricsFromBytes`. Leave the `default` branch decoding optimistically — never turn a newer-than-us payload into a hard error.
+
+7. **Add `upconvertVN`, and chain adjacent versions.** Today `upconvertV1` maps straight to current because there are only two versions. At three, refactor so each upconverter targets the *next* version (`v1→v2`, `v2→v3`) and chain them — otherwise every new version needs a new direct mapping from every old one. Set `WireVersion` to the version actually received, not the current one.
+
+8. **Extend `v1ToV2KeyRenames`** (rename it per version) in `wire_version_test.go` with any renamed json path. The completeness test fails loudly on an unlisted rename, which is the intended behaviour — do not "fix" it by deleting the assertion.
+
+9. **Add a golden fixture** `testdata/vN_payload.json` for the version being frozen, as readable JSON, and a test decoding it. Fixtures are what pin the bytes real guests send.
+
+10. **Update the version table in `README.md`** and run `make docker-test`.
+
+**Sanity-check the completeness test still bites.** Delete one field from an upconverter, confirm `TestUpconvertV1LosesNothing` fails, restore it. A completeness test that has quietly stopped covering anything is worse than none, because it licenses the assumption that mappings are checked.
 
 ### Vsock I/O (`pkg/vsock`)
 `server.VsockListener` creates a non-blocking AF_VSOCK SOCK_STREAM socket bound to `VMADDR_CID_ANY`, and `Accept` polls (100 ms timeout) so `ctx.Done()` / `Close()` can interrupt it — the receiver uses context cancellation + `Close()` for shutdown. `client.NewClientConnection` connects to `VMADDR_CID_HOST` (CID 2). The exporter opens a **fresh connection per send** (connect → SendData → send empty close-frame → Close); there is no persistent connection.
 
+`VsockConn.SetReadDeadline` **is** implemented (`SetDeadline`/`SetWriteDeadline` remain no-ops). A net.Conn deadline is absolute while `SO_RCVTIMEO` is an interval, so `Read` recomputes the remainder and re-arms the option on every call, translating the resulting `EAGAIN` into `os.ErrDeadlineExceeded`; clearing the deadline disarms it. This relies on AF_VSOCK honouring `SO_RCVTIMEO` (it does — `sock_setsockopt` sets `sk_rcvtimeo` and `vsock_connectible_recvmsg` waits on it), and on `accept` not propagating the listener's `O_NONBLOCK` to the accepted fd (it doesn't — otherwise every read would return `EAGAIN` instantly and be misreported as expiry). Both are pinned by `deadline_vsock_test.go`, which runs against a real loopback vsock connection and skips where the `vsock_loopback` module is absent.
+
 ### Receiver lifecycle (`pkg/gpumetricsreceiver`)
-`Run(ctx)` accepts connections in a loop, spawns `handleConnection` per connection (tracked in a `connections` map + `wg`), and decodes each frame into `GpuMetrics`, stamping `Source.VsockClientID = conn.RemoteAddr().CID` before calling the consumer. It rejects CID < 3 (host/well-known). Shutdown is coordinated through an `atomic.Int32 stopping` flag plus `shutdownOnContextDone`; the consumer interface is `GpuMeticsConsumer.OnGpuMetricsReceived(*GpuMetrics) error`. The default consumer in `cmd/gpu-metrics-receiver/main.go` just logs — real consumers get plugged in here.
+`Run(ctx)` accepts connections in a loop, spawns `handleConnection` per connection (tracked in a `connections` map + `wg`), and decodes each frame into `GpuMetrics`, stamping `Source.VsockClientID = conn.RemoteAddr().CID` before calling the consumer. It rejects CID < 3 (host/well-known). Shutdown is coordinated through an `atomic.Int32 stopping` flag plus `shutdownOnContextDone`; the consumer interface is `GpuMetricsConsumer.OnGpuMetricsReceived(*GpuMetrics) error`. The default consumer (`GpuMetricsLogConsumer`, wired up in `cmd/gpu-metrics-receiver/main.go`) just logs — real consumers get plugged in here. The consumer is called on the goroutine serving that connection, so it must tolerate concurrent calls from several guests.
+
+**Guests are less trusted than the host**, so the receiver bounds them: `MaxConnections` (default 64) caps total simultaneous connections, `MaxConnectionsPerCID` (default 4) caps them per VM via the `cidCounts` map, and `ReadTimeout` (default 60 s) arms a per-frame read deadline so a guest that sends a header and goes silent cannot pin a goroutine and fd until the process exits. Zero values in the config get the defaults, so a receiver constructed without limits is still bounded. Keep it that way when adding config.
 
 ## Conventions
 
 - Logging is uber zap, production config, RFC3339Nano timestamps, JSON to stderr, no caller/stacktrace. Each component tags logs with `zap.String("component", "gpu-metrics-exporter"|-receiver|-consumer)`.
 - Deployment is via `.deb` packages built by `scripts/build-deb.sh` from `debian/<pkg>/DEBIAN/` templates (`control` + `postinst`/`prerm`/`postrm`) plus the binary and systemd unit — `make deb` drives it. The systemd units use **port 9999** and **tickPeriod 60** for the exporter — note these differ from the CLI defaults (port 1234, tick 10) in `main.go`.
-- Module path: `go.mws.cloud/gpu-metrics-exporter`. Internal imports use the full `github.com/mws-cloud-platform/...` path.
-- The exported consumer interface is spelled `GpuMeticsConsumer` (missing the `r` in "Metrics") — this is intentional/legacy, not a typo to fix casually: it's a public API name and renaming it is a breaking change for out-of-tree consumers.
+- Module path: `go.mws.cloud/gpu-metrics-exporter`, and internal imports use exactly that prefix (`go.mws.cloud/gpu-metrics-exporter/pkg/...`). There is no `github.com/...` import path in the tree; don't introduce one.
+- Both `cmd/*/main.go` use `signal.NotifyContext` with a deferred `stop()`, so `stop()` only runs once `run()` returns. A registered handler suppresses the default terminate action, which means **a second SIGINT/SIGTERM during shutdown is swallowed** — a wedged shutdown can only be escaped with SIGKILL (systemd waits out its 90 s default, as neither unit sets `TimeoutStopSec`). Calling `stop()` as soon as the context is cancelled would restore the escape hatch.
+- Payload contents are logged at **Debug**, never Info: one tick on an 8-GPU box carries up to 18 NVLink links × 5 counters per card, and the same payload passes through the exporter's send path, the receiver, and the consumer. At Info that is tens of KiB into journald per VM per tick. The same goes for `runCommand`'s full `dmesg`/`systemctl` output.
+- The public wire and API names were corrected before open-sourcing (`GpuMetricsSouce` → `GpuMetricsSource`, `GpuMeticsConsumer` → `GpuMetricsConsumer`, `tx_throughtput`/`rx_throughtput` → `tx_throughput`/`rx_throughput`). No out-of-tree consumers are pinned to the old spellings; keep the corrected names. **The json-tag rename is a wire break within the fleet, though** — exporter and receiver ship as independent `.deb`s, so during a staged rollout one side writes the old key while the other reads the new one, and `encoding/json` silently decodes the missing field as `0` rather than erroring (indistinguishable from an idle PCIe link). Upgrade both sides together, or accept a window of zeroed `tx_throughput`/`rx_throughput`. Any future json-tag rename carries the same hazard.
 - `make deb` requires Docker (it depends on `docker-build`); `VERSION` may be empty, in which case `scripts/build-deb.sh` falls back to `git describe --tags --always` (then `0.0.0-dev`).
+- The build image uses Ubuntu's own apt archives by default, so it builds anywhere. From networks where those are blocked, pass `--build-arg APT_MIRROR=http://mirror.yandex.ru/ubuntu`.
+- The Go toolchain tarball is checksum-verified during the build, so **`GO_SHA256` must be bumped together with `GO_VERSION`** in `docker/local-build.Dockerfile`. A mismatch failing the build is the point — it means the build no longer trusts whatever the network returns.
+- `make lint` runs golangci-lint pinned to the same image CI uses. The `-alpine` variant will not work: go-nvml is cgo and alpine ships no C compiler. The misspell exclusion for `pkg/gpumetrics/vN` in `.golangci.yml` is load-bearing — `tx_throughtput` is the real spelling on the wire for already-deployed exporters, so "correcting" it would break decoding of payloads already in the field.
+- `LICENSE` is the org's agreed short-form Apache 2.0 notice (matching `mws-cloud-platform/go-sdk`), not the full license text. A consequence: GitHub's license detector matches on full text, so it reports no license for the repo — the README carries a static license badge instead. Don't "fix" this by restoring the full text without checking, it is a deliberate org-wide choice.

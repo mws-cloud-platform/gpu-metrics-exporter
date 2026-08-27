@@ -10,14 +10,14 @@ import (
 // regression in any json tag surfaces as a diff.
 func sampleGpuMetrics() *GpuMetrics {
 	m := NewGpuMetrics()
-	m.Source = GpuMetricsSouce{VsockClientID: 42, InstanceID: "i-abc123"}
+	m.Source = GpuMetricsSource{VsockClientID: 42, InstanceID: "i-abc123"}
 	m.ExporterInfo = ExporterInfo{
 		Seqno: 7, Timestamp: 1700000000, Version: "2026.06.08-2", StartTime: 1699999000,
 		InitNVMLError: "", GetDeviceCountError: "", ReadInstanceIDError: "",
 		SendMetricsErrorCount: 3, SendMetricsLastError: "boom",
 	}
 	m.NvFabricManagerStatus = NvFabricManagerStatus{Active: true, Enabled: true, NotDegraded: true}
-	m.XIDErrors = XIDErrors{XIDErrors: []string{"Xid 79 on GPU 0", "SXid 13"}}
+	m.XIDErrors = XIDErrors{XIDErrors: []string{"Xid 79 on GPU 0", "SXid 13"}, DroppedCount: 4}
 	m.GpuDeviceCount = 2
 	m.Gpus = []GPUInfo{
 		{
@@ -35,6 +35,16 @@ func sampleGpuMetrics() *GpuMetrics {
 				PCIGen: 5, LinkWidth: 16, MaxPCIGen: 5, MaxLinkWidth: 16,
 				TxThroughput: 1234, RxThroughput: 4321,
 			},
+			MIG: MIGInfo{
+				Supported: true, Enabled: true, PendingEnabled: true, PendingChange: false,
+				InstanceCount: 1,
+				Instances: []MIGInstance{{
+					Index: 0, UUID: "MIG-aaaa", Name: "NVIDIA H100 MIG 3g.40gb",
+					GpuInstanceID: 1, ComputeInstanceID: 0,
+					MemoryTotal: 40 * 1024 * 1024 * 1024, MemoryUsed: 512, MemoryFree: 256,
+					MultiprocessorCount: 60, GpuInstanceSliceCount: 3, ComputeInstanceSliceCount: 3,
+				}},
+			},
 			DriverModel:           "WDDM",
 			DriverVersion:         "535.129.03",
 			VBios:                 "96.00.7F.00.01",
@@ -43,29 +53,30 @@ func sampleGpuMetrics() *GpuMetrics {
 			PerformanceState:      "P0",
 			PerformanceStateValue: 0,
 			ECC: ECCInfo{
-				Enabled: true, Pending: false, Mode: "Enabled",
+				Supported: true, Enabled: true, Pending: false, Mode: "Enabled",
 				DRAMErrors: ECCErrorsCounters{
-					Volatile:  ECCErrors{Correctable: 10, Uncorrectable: 1, CorrectableDelta: 2, UncorrectableDelta: 1},
-					Aggregate: ECCErrors{Correctable: 100, Uncorrectable: 5, CorrectableDelta: 0, UncorrectableDelta: 0},
+					Volatile:  ECCErrors{Supported: true, Correctable: 10, Uncorrectable: 1, CorrectableDelta: 2, UncorrectableDelta: 1},
+					Aggregate: ECCErrors{Supported: true, Correctable: 100, Uncorrectable: 5, CorrectableDelta: 0, UncorrectableDelta: 0},
 				},
 				SRAMErrors: ECCErrorsCounters{
-					Volatile:  ECCErrors{Correctable: 3, Uncorrectable: 0, CorrectableDelta: 3, UncorrectableDelta: 0},
-					Aggregate: ECCErrors{Correctable: 9, Uncorrectable: 0, CorrectableDelta: 0, UncorrectableDelta: 0},
+					Volatile:  ECCErrors{Supported: false, Correctable: 3, Uncorrectable: 0, CorrectableDelta: 3, UncorrectableDelta: 0},
+					Aggregate: ECCErrors{Supported: true, Correctable: 9, Uncorrectable: 0, CorrectableDelta: 0, UncorrectableDelta: 0},
 				},
 				RetiredPages: RetiredPagesInfo{
-					SBEPages: 2, DBEPages: 0, SBEPagesDelta: 1, DBEPagesDelta: 0,
+					Supported: true,
+					SBEPages:  2, DBEPages: 0, SBEPagesDelta: 1, DBEPagesDelta: 0,
 					PendingPages: 0, PendingPagesDelta: 0, Error: "",
 				},
 			},
 			RowRemapping: RowRemappingInfo{
-				Pending: false, Failed: false,
+				Supported: true, Pending: false, Failed: false,
 				Correctable: 4, Uncorrectable: 0, CorrectableDelta: 1, UncorrectableDelta: 0,
 			},
 			ClocksThrottle: ClocksThrottleInfo{
 				ThrottleReasons: 0, ThrottleReasonsStr: "None",
 				EventReasons: 0, EventReasonsStr: "None",
 			},
-			NvLink: NvLinkInfo{Links: []NvLinkState{
+			NvLink: NvLinkInfo{Supported: true, Links: []NvLinkState{
 				{
 					LinkIndex: 0, State: "Active",
 					Errors:      map[int]uint64{0: 5, 1: 7},

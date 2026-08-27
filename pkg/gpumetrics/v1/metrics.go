@@ -1,16 +1,22 @@
-package gpumetrics
+// Package v1 is a frozen snapshot of the metrics wire format as shipped in tag
+// 2026.07.29-1.
+//
+// It exists so the receiver can still decode payloads from exporters running in
+// guest VMs that have not been upgraded — and since customers have root, some
+// never will. Nothing here may be edited: these structs describe bytes that are
+// already in the field, so a "fix" would silently change how historical
+// payloads decode. Field names, json tags, and types are all load-bearing,
+// including the tx_throughtput/rx_throughtput misspellings, which are the real
+// spelling in v1 payloads.
+//
+// New work belongs in the current package; upconvertV1 maps these into it.
+package v1
 
-import (
-	"bytes"
-	"compress/gzip"
-	"encoding/json"
-)
-
-// GpuMetricsSource identifies where a metrics payload originated: the guest
+// GpuMetricsSouce identifies where a metrics payload originated: the guest
 // VM's vsock CID (filled in by the receiver from the peer address) and its
 // cloud-init instance ID (read by the exporter). Downstream code is expected
 // to map VsockClientID -> VMID.
-type GpuMetricsSource struct {
+type GpuMetricsSouce struct {
 	VsockClientID uint32 `json:"vsock_client_id"`
 	InstanceID    string `json:"instance_id"`
 }
@@ -20,24 +26,6 @@ type CUDAComputeCapability struct {
 	Major int `json:"major"`
 	Minor int `json:"minor"`
 }
-
-// Facets NVML can decline to report — ECC counters, retired pages, row
-// remapping, NVLink — carry a Supported flag next to their Error string, and
-// the two say different things:
-//
-//	Supported=false, Error=""   the hardware or driver does not report this at
-//	                            all: an Ampere card has no retired pages, a
-//	                            pre-Ampere one no row remapping, a MIG-enabled
-//	                            one no volatile ECC counters. Normal, permanent,
-//	                            not worth an alert.
-//	Supported=true,  Error!=""  the query broke. That is the signal.
-//
-// Before the split, every NOT_SUPPORTED answer was written into Error, so a
-// healthy A100 shipped a dozen error strings per tick and any rule of the form
-// `error != ""` was pure noise — which is how a rule like that stops being read
-// at all. Zero values only mean "zero" while Supported is true; while it is
-// false they mean "not reported", the same way a zero means it for a field an
-// exporter too old to collect it never sent (see WireVersion).
 
 // GPUInfo represents the complete information we want to collect about a GPU
 type GPUInfo struct {
@@ -76,53 +64,6 @@ type GPUInfo struct {
 	Architecture          string                `json:"architecture"`
 	CUDAComputeCapability CUDAComputeCapability `json:"cuda_compute_capability"`
 	PersistenceMode       int                   `json:"persistence_mode"`
-	MIG                   MIGInfo               `json:"mig_info"`
-}
-
-// MIGInfo describes a GPU's Multi-Instance GPU partitioning.
-//
-// Supported is false on GPUs where NVML reports MIG as unsupported at all
-// (anything pre-Ampere, and Ampere+ cards whose driver refuses the query); the
-// remaining fields are meaningless then. Enabled reflects the mode in force
-// now, PendingEnabled the mode NVML will apply once the GPU is reset or all
-// clients release it, and PendingChange is the actionable difference: the two
-// disagree, so the partitioning an operator asked for is not the one running.
-//
-// Reading Enabled matters beyond MIG itself: with MIG on, NVML answers many
-// whole-device queries — utilization, per-device ECC volatile counters, clocks
-// — with NOT_SUPPORTED. The collectors treat that as "leave zero-valued", so a
-// MIG-enabled GPU reports zeros that a consumer would otherwise read as a genuinely
-// idle card. mig_info.enabled is how to tell those two apart.
-type MIGInfo struct {
-	Supported      bool          `json:"supported"`
-	Enabled        bool          `json:"enabled"`
-	PendingEnabled bool          `json:"pending_enabled"`
-	PendingChange  bool          `json:"pending_change"`
-	InstanceCount  int           `json:"instance_count"`
-	Instances      []MIGInstance `json:"instances"`
-	Error          string        `json:"error"`
-}
-
-// MIGInstance is one instantiated MIG device: a compute instance within a GPU
-// instance, which NVML addresses through its own device handle.
-//
-// GpuInstanceID and ComputeInstanceID are the identifiers NVML and nvidia-smi
-// use to name the partition, and together with the parent GPU's UUID they
-// identify it across ticks. SliceCount fields give the partition's size in the
-// card's slice units (e.g. 3 of 7 on an A100 3g.40gb).
-type MIGInstance struct {
-	Index                     int    `json:"index"`
-	UUID                      string `json:"uuid"`
-	Name                      string `json:"name"`
-	GpuInstanceID             int    `json:"gpu_instance_id"`
-	ComputeInstanceID         int    `json:"compute_instance_id"`
-	MemoryTotal               uint64 `json:"memory_total_bytes"`
-	MemoryUsed                uint64 `json:"memory_used_bytes"`
-	MemoryFree                uint64 `json:"memory_free_bytes"`
-	MultiprocessorCount       uint   `json:"multiprocessor_count"`
-	GpuInstanceSliceCount     uint   `json:"gpu_instance_slice_count"`
-	ComputeInstanceSliceCount uint   `json:"compute_instance_slice_count"`
-	Error                     string `json:"error"`
 }
 
 // GPUUtilization holds current GPU and memory utilization as percentages.
@@ -149,37 +90,24 @@ type PCIInfo struct {
 	LinkWidth    uint   `json:"link_width_current"`
 	MaxPCIGen    uint   `json:"max_pci_generation"`
 	MaxLinkWidth uint   `json:"max_link_width"`
-	TxThroughput uint32 `json:"tx_throughput"`
-	RxThroughput uint32 `json:"rx_throughput"`
+	TxThroughput uint32 `json:"tx_throughtput"`
+	RxThroughput uint32 `json:"rx_throughtput"`
 }
 
 // ECCInfo holds the GPU's ECC mode and error counters for DRAM/SRAM memory and
 // retired pages. Delta fields carry the per-tick change since the last report.
-//
-// Supported reports whether NVML answered the ECC-mode query at all. It is
-// what separates a card that does not do ECC from one whose ECC state could
-// not be read: both leave Enabled false and Mode empty, and only the second is
-// a fault. Error carries a genuine failure of that query.
 type ECCInfo struct {
-	Supported    bool              `json:"supported"`
 	Enabled      bool              `json:"enabled"`
 	Pending      bool              `json:"pending"`
 	Mode         string            `json:"mode"`
 	DRAMErrors   ECCErrorsCounters `json:"dram_errors"`
 	SRAMErrors   ECCErrorsCounters `json:"sram_errors"`
 	RetiredPages RetiredPagesInfo  `json:"retired_pages"`
-	Error        string            `json:"error"`
 }
 
 // ECCErrors holds correctable and uncorrectable ECC error counts for one
 // counter scope (volatile or aggregate), plus their per-tick deltas.
-//
-// Supported is true once NVML has returned a value for either counter in the
-// scope. A MIG-enabled GPU answers NOT_SUPPORTED for the whole volatile scope
-// while still serving the aggregate one, so the flag is per scope rather than
-// per GPU.
 type ECCErrors struct {
-	Supported          bool   `json:"supported"`
 	Correctable        uint64 `json:"correctable"`
 	Uncorrectable      uint64 `json:"uncorrectable"`
 	CorrectableDelta   int64  `json:"correctable_delta"`
@@ -196,12 +124,7 @@ type ECCErrorsCounters struct {
 
 // RetiredPagesInfo holds counts of retired GPU memory pages due to ECC errors,
 // with per-tick deltas. SBE = single-bit, DBE = double-bit.
-//
-// Supported is false on every Ampere-and-later GPU: page retirement was
-// replaced by row remapping there, so NVML reports none of the FI_DEV_RETIRED_*
-// fields. Read RowRemappingInfo on those cards.
 type RetiredPagesInfo struct {
-	Supported         bool   `json:"supported"`
 	SBEPages          uint64 `json:"sbe_pages"`
 	DBEPages          uint64 `json:"dbe_pages"`
 	SBEPagesDelta     int64  `json:"sbe_pages_delta"`
@@ -213,11 +136,7 @@ type RetiredPagesInfo struct {
 
 // RowRemappingInfo holds row remapping state for GPUs that support it, with
 // per-tick deltas of corrected and uncorrected remapped rows.
-//
-// Supported is false on pre-Ampere GPUs, which retire whole pages instead —
-// the mirror of RetiredPagesInfo, and the reason both carry the flag.
 type RowRemappingInfo struct {
-	Supported          bool   `json:"supported"`
 	Pending            bool   `json:"pending"`
 	Failed             bool   `json:"failed"`
 	Correctable        uint64 `json:"correctable"`
@@ -227,8 +146,7 @@ type RowRemappingInfo struct {
 	Error              string `json:"error"`
 }
 
-// ClocksThrottleInfo holds the GPU's current clocks throttle and event reasons
-// (bitmasks) plus their human-readable forms.
+// Clocks throttle information
 type ClocksThrottleInfo struct {
 	ThrottleReasons    uint64 `json:"throttle_reasons"`
 	ThrottleReasonsStr string `json:"throttle_reasons_string"`
@@ -236,26 +154,13 @@ type ClocksThrottleInfo struct {
 	EventReasonsStr    string `json:"event_reasons_string"`
 }
 
-// NvLinkInfo holds per-link NVLink state and error counters for a GPU.
-//
-// Links carries one entry per link the GPU actually has, not one per possible
-// link index: NVML's NVLINK_MAX_LINKS is a header ceiling (18), while an A100
-// has 12 and a card with no NVLink at all has none. Entries keep their real
-// link index in LinkIndex, so match on that rather than on slice position.
-//
-// Supported says NVML reported at least one link, which is what makes an empty
-// Links distinguishable from a GPU whose links could not be enumerated.
+// NVLink information
 type NvLinkInfo struct {
-	Supported bool          `json:"supported"`
-	Links     []NvLinkState `json:"links"`
+	Links []NvLinkState `json:"links"`
 }
 
 // NvLinkState holds the state and per-error-type counters for a single NVLink
 // link, with per-tick deltas keyed by NVML error counter type.
-//
-// Errors holds only the counters NVML served; a missing key means that counter
-// is unavailable, which is the normal answer for an inactive link and not an
-// error. Error is reserved for a query that failed for some other reason.
 type NvLinkState struct {
 	LinkIndex   int            `json:"index"`
 	State       string         `json:"state"`
@@ -289,60 +194,19 @@ type NvFabricManagerStatus struct {
 }
 
 // XIDErrors holds recent XID/SXID error lines collected from the kernel log.
-// A line is re-shipped on every payload until one carrying it is confirmed
-// delivered, so a transient send failure cannot lose an error. DroppedCount is
-// the cumulative number of lines the exporter had to discard because that
-// pending buffer overflowed — non-zero means XID errors were lost, and the
-// kernel log on the guest is the only remaining record of them.
 type XIDErrors struct {
-	Error        string   `json:"error"`
-	XIDErrors    []string `json:"xid_errors"`
-	DroppedCount int64    `json:"dropped_count"`
+	Error     string   `json:"error"`
+	XIDErrors []string `json:"xid_errors"`
 }
 
 // GpuMetrics is the top-level payload exchanged between the guest exporter and
 // the host receiver: provenance, exporter health, fabric-manager status, XID
 // errors, and one GPUInfo entry per detected GPU.
 type GpuMetrics struct {
-	// WireVersion is the format version the *exporter* spoke, not the shape of
-	// this struct: NewGpuMetricsFromBytes always returns the current shape,
-	// upconverting older payloads into it. So a value below CurrentWireVersion
-	// means some fields could not possibly have been populated — a v1 exporter
-	// knows nothing of mig_info or xid_errors.dropped_count, and their zero
-	// values mean "not reported", not "reported as zero". Consumers that care
-	// about the difference must check this.
-	WireVersion           int                   `json:"wire_version"`
-	Source                GpuMetricsSource      `json:"source"`
+	Source                GpuMetricsSouce       `json:"source"`
 	ExporterInfo          ExporterInfo          `json:"exporter_info"`
 	NvFabricManagerStatus NvFabricManagerStatus `json:"nv_fabric_manager_status"`
 	XIDErrors             XIDErrors             `json:"xid_errors"`
 	GpuDeviceCount        int                   `json:"gpu_device_count"`
 	Gpus                  []GPUInfo             `json:"gpu_info"`
-}
-
-// NewGpuMetrics returns a zero-value GpuMetrics ready to be populated.
-func NewGpuMetrics() *GpuMetrics {
-	m := &GpuMetrics{WireVersion: CurrentWireVersion}
-	return m
-}
-
-// compressJSON marshals v to JSON and gzip-compresses the result.
-func compressJSON(data interface{}) ([]byte, error) {
-	jsonData, err := json.Marshal(data)
-	if err != nil {
-		return nil, err
-	}
-
-	var buf bytes.Buffer
-	writer := gzip.NewWriter(&buf)
-	if _, err := writer.Write(jsonData); err != nil {
-		_ = writer.Close()
-		return nil, err
-	}
-
-	if err := writer.Close(); err != nil {
-		return nil, err
-	}
-
-	return buf.Bytes(), nil
 }

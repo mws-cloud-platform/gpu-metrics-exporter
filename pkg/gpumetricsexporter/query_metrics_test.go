@@ -1,10 +1,43 @@
 package gpumetricsexporter
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/NVIDIA/go-nvml/pkg/nvml"
 )
+
+// TestRemoveStrings covers the helper that drains the XID buffer on a
+// successful send: only the lines a payload actually carried are retired, the
+// rest stay pending for the next tick, and order is preserved.
+func TestRemoveStrings(t *testing.T) {
+	tests := []struct {
+		name string
+		dst  []string
+		drop []string
+		want []string
+	}{
+		{
+			name: "drains delivered subset, keeps pending",
+			dst:  []string{"Xid 79 on GPU 0", "SXid 13", "Xid 119"},
+			drop: []string{"Xid 79 on GPU 0", "SXid 13"},
+			want: []string{"Xid 119"},
+		},
+		{name: "drop nothing", dst: []string{"a", "b"}, drop: nil, want: []string{"a", "b"}},
+		{name: "drop everything", dst: []string{"a", "b"}, drop: []string{"a", "b"}, want: []string{}},
+		{name: "drop not present", dst: []string{"a"}, drop: []string{"z"}, want: []string{"a"}},
+		{name: "empty dst", dst: nil, drop: []string{"a"}, want: nil},
+		{name: "duplicate in dst preserved once removed", dst: []string{"a", "a", "b"}, drop: []string{"a"}, want: []string{"b"}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := removeStrings(tc.dst, tc.drop)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("removeStrings(%v, %v) = %v, want %v", tc.dst, tc.drop, got, tc.want)
+			}
+		})
+	}
+}
 
 func TestGetValueDelta(t *testing.T) {
 	tests := []struct {

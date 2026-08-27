@@ -32,16 +32,49 @@ type GpuMetricsExporter struct {
 	seqno                 atomic.Int64
 	config                GpuMetricsExporterConfig
 	startTime             int64
-	instanceID            string
 	initNVMLError         string
 	sendMetricsErrorCount int64
 	sendMetricsLastError  string
 	lastMetricsMu         sync.RWMutex
 	lastMetrics           *gpumetrics.GpuMetrics
+	// XID/SXID error-line tracking. unsentXIDErrors holds lines that have been
+	// observed in dmesg but whose carrying payload has not yet been confirmed
+	// delivered: they ride along on every subsequent payload until a send
+	// succeeds, so a transient send failure (or a send stall lasting longer
+	// than the dmesg look-back window) cannot silently drop an XID.
+	// retiredXIDErrors maps a line that has left the pending buffer — whether
+	// delivered or dropped on overflow — to when it left, so the overlapping
+	// dmesg window cannot re-admit it; records are pruned once they age out of
+	// that window. Dropped lines belong in here too: a line that is neither
+	// pending nor retired looks fresh on the next tick and gets re-queued
+	// behind newer lines, which then get evicted in its place.
+	// xidErrorsDropped counts lines evicted on overflow and is reported on the
+	// wire as XIDErrors.DroppedCount. All three are guarded by lastMetricsMu.
+	unsentXIDErrors  []string
+	retiredXIDErrors map[string]time.Time
+	xidErrorsDropped int64
 }
 
 const (
 	metricsQueueCapacity = 32
+
+	// maxUnsentXIDErrors bounds the XID/SXID re-ship buffer. The buffer must be
+	// bounded: while the host receiver is unreachable, every XID line observed
+	// accumulates and the whole set rides on every payload, growing it until
+	// the gzipped frame passes the 64 KiB vsock limit — at which point SendData
+	// fails on size for good and the exporter never recovers, even once the
+	// host returns. On overflow the oldest lines go first (the newest describe
+	// the current fault) and the loss is counted, never silent.
+	maxUnsentXIDErrors = 128
+
+	// maxRetiredXIDErrors backstops the retired-line set for the case where a
+	// single dmesg window carries more distinct lines than age-based pruning
+	// retires.
+	maxRetiredXIDErrors = 1024
+
+	// xidDmesgWindowSlack is added to TickPeriod to form the dmesg look-back
+	// window, so consecutive ticks overlap and no line falls between them.
+	xidDmesgWindowSlack = 10 * time.Second
 )
 
 // NewGpuMetricsExporter constructs an exporter from config. A non-positive
@@ -101,7 +134,7 @@ func (e *GpuMetricsExporter) sendMetricsLoop(ctx context.Context) {
 	for {
 		select {
 		case m := <-e.metricsQueue:
-			e.sendMetrics(m)
+			_ = e.sendMetrics(m)
 		case <-ctx.Done():
 			e.log.Info("received stop signal")
 			return
@@ -113,6 +146,8 @@ func (e *GpuMetricsExporter) sendMetricsLoop(ctx context.Context) {
 // runs the query loop in the calling goroutine until the context is done.
 // It blocks until both loops have stopped and NVML has been shut down.
 func (e *GpuMetricsExporter) Run(ctx context.Context) error {
+	defer e.queryMetricsTicker.Stop()
+
 	e.log.Info("run", zap.Int("ServerPort", e.config.ServerPort), zap.Duration("TickPeriod", e.config.TickPeriod))
 	e.startTime = time.Now().UTC().Unix()
 
