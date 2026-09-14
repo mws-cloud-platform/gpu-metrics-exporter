@@ -155,7 +155,7 @@ When changing the format:
 | `get_device_count_error` | Error from `DeviceGetCount`, empty on success |
 | `read_instance_id_error` | Error reading the instance ID, empty on success |
 | `send_metrics_error_count` | Running total of send failures since start |
-| `send_metrics_last_error` | Most recent send failure message |
+| `send_metrics_last_error` | Last send failure message; cleared on the next successful send, so non-empty means the channel is broken *now* |
 
 ### Fabric manager (`nv_fabric_manager_status`)
 

@@ -99,6 +99,45 @@ func TestInitNVMLForTick(t *testing.T) {
 	})
 }
 
+// TestSendMetricsLastErrorClearsOnSuccess covers the error-message lifecycle
+// of the send path: a failure records the message, a confirmed delivery
+// clears it, and the counter stays cumulative throughout. Without the clear,
+// a message from before a receiver restart rode on every payload forever —
+// the field read as an ongoing problem while sends were succeeding.
+func TestSendMetricsLastErrorClearsOnSuccess(t *testing.T) {
+	e := newXIDTestExporter()
+
+	// Failure path: counter bumps, message recorded.
+	e.recordSendMetricsError("client.NewClientConnection error: connection reset by peer")
+	if e.sendMetricsErrorCount != 1 {
+		t.Fatalf("sendMetricsErrorCount = %d, want 1", e.sendMetricsErrorCount)
+	}
+	if e.sendMetricsLastError == "" {
+		t.Fatal("sendMetricsLastError empty after a recorded failure")
+	}
+
+	// Success path (the clear sendMetrics performs after a confirmed
+	// delivery): message cleared, counter untouched.
+	e.lastMetricsMu.Lock()
+	e.clearSendMetricsLastError()
+	e.lastMetricsMu.Unlock()
+	if e.sendMetricsLastError != "" {
+		t.Fatalf("sendMetricsLastError = %q after successful send, want empty", e.sendMetricsLastError)
+	}
+	if e.sendMetricsErrorCount != 1 {
+		t.Fatalf("sendMetricsErrorCount = %d after successful send, want 1 (cumulative)", e.sendMetricsErrorCount)
+	}
+
+	// A later failure records again.
+	e.recordSendMetricsError("c.SendData error: frame too large")
+	if e.sendMetricsErrorCount != 2 {
+		t.Fatalf("sendMetricsErrorCount = %d, want 2", e.sendMetricsErrorCount)
+	}
+	if e.sendMetricsLastError != "c.SendData error: frame too large" {
+		t.Fatalf("sendMetricsLastError = %q, want the new failure message", e.sendMetricsLastError)
+	}
+}
+
 // TestRemoveStrings covers the helper that drains the XID buffer on a
 // successful send: only the lines a payload actually carried are retired, the
 // rest stay pending for the next tick, and order is preserved.
