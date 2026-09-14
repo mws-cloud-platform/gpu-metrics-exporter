@@ -2,7 +2,6 @@ package gpumetricsexporter
 
 import (
 	"context"
-	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,14 +24,20 @@ type GpuMetricsExporterConfig struct {
 // to the host over vsock. Collection and sending run on separate goroutines
 // connected by a buffered queue so a slow send cannot stall NVML collection.
 type GpuMetricsExporter struct {
-	log                   *zap.Logger
-	queryMetricsTicker    *time.Ticker
-	wg                    sync.WaitGroup
-	metricsQueue          chan *gpumetrics.GpuMetrics
-	seqno                 atomic.Int64
-	config                GpuMetricsExporterConfig
-	startTime             int64
-	initNVMLError         string
+	log                *zap.Logger
+	queryMetricsTicker *time.Ticker
+	wg                 sync.WaitGroup
+	metricsQueue       chan *gpumetrics.GpuMetrics
+	seqno              atomic.Int64
+	config             GpuMetricsExporterConfig
+	startTime          int64
+	nvmlInitialized    bool
+	initNVMLError      string
+	// initNVMLFn/shutdownNVMLFn are the NVML lifecycle calls behind
+	// initNVMLForTick/shutdownNVML, swappable in tests to drive the
+	// failure/retry/recovery paths without a GPU.
+	initNVMLFn            func() error
+	shutdownNVMLFn        func()
 	sendMetricsErrorCount int64
 	sendMetricsLastError  string
 	lastMetricsMu         sync.RWMutex
@@ -94,6 +99,10 @@ func NewGpuMetricsExporter(config GpuMetricsExporterConfig) *GpuMetricsExporter 
 		metricsQueue:       make(chan *gpumetrics.GpuMetrics, metricsQueueCapacity),
 		config:             config,
 	}
+	// NVML lifecycle defaults; tests swap these to drive the
+	// failure/retry/recovery paths without a GPU.
+	e.initNVMLFn = e.initNVML
+	e.shutdownNVMLFn = e.shutdownNVMLReal
 	// Initialize seqno to 0
 	e.seqno.Store(0)
 	return e
@@ -142,25 +151,16 @@ func (e *GpuMetricsExporter) sendMetricsLoop(ctx context.Context) {
 	}
 }
 
-// Run starts the exporter: initializes NVML, launches the send goroutine, and
-// runs the query loop in the calling goroutine until the context is done.
-// It blocks until both loops have stopped and NVML has been shut down.
+// Run starts the exporter: launches the send goroutine and runs the query
+// loop in the calling goroutine until the context is done. NVML is
+// initialized and shut down around every collection tick (see
+// initNVMLForTick), so a failed init is retried and a library update on
+// disk is picked up without restarting the exporter.
 func (e *GpuMetricsExporter) Run(ctx context.Context) error {
 	defer e.queryMetricsTicker.Stop()
 
 	e.log.Info("run", zap.Int("ServerPort", e.config.ServerPort), zap.Duration("TickPeriod", e.config.TickPeriod))
 	e.startTime = time.Now().UTC().Unix()
-
-	err := e.initNVML()
-	if err != nil {
-		e.initNVMLError = fmt.Sprintf("e.initNVML error: %v", err)
-		e.log.Error("e.initNVML", zap.Error(err))
-	}
-	defer func() {
-		if e.initNVMLError == "" {
-			e.shutdownNVML()
-		}
-	}()
 
 	e.wg.Add(1)
 	go e.sendMetricsLoop(ctx)
