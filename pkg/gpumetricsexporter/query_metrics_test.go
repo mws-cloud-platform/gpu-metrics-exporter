@@ -1,11 +1,142 @@
 package gpumetricsexporter
 
 import (
+	"errors"
 	"reflect"
 	"testing"
+	"time"
 
 	"github.com/NVIDIA/go-nvml/pkg/nvml"
+	"go.uber.org/zap"
 )
+
+// TestInitNVMLForTick covers the per-tick NVML lifecycle: init is attempted
+// on every tick (a failing init — e.g. "Driver/library version mismatch"
+// after a guest-side driver upgrade without a reboot — must not pin the
+// exporter to empty metrics until the VM is restarted), and a successful
+// tick is paired with a shutdown that releases the dlopen handle so a
+// library update on disk is picked up by the next tick. Both are guarded on
+// nvmlInitialized: shutdown after a failed init must be a no-op (the real
+// nvml.Shutdown would be a cgo abort no recover() can contain), and a second
+// init must not bump NVML's refcount past what the paired shutdown releases.
+func TestInitNVMLForTick(t *testing.T) {
+	newExporter := func() *GpuMetricsExporter {
+		return NewGpuMetricsExporter(GpuMetricsExporterConfig{
+			ServerPort: 9999,
+			Log:        zap.NewNop(),
+			TickPeriod: 60 * time.Second,
+		})
+	}
+
+	t.Run("init failure retried on every tick, recovers on its own", func(t *testing.T) {
+		e := newExporter()
+		initErr := errors.New("Driver/library version mismatch")
+		inits, shutdowns := 0, 0
+		e.initNVMLFn = func() error {
+			inits++
+			if inits < 3 {
+				return initErr
+			}
+			return nil
+		}
+		e.shutdownNVMLFn = func() { shutdowns++ }
+
+		// Tick 1 and 2: init fails, error recorded, nvmlInitialized false.
+		// shutdownNVML no-ops on these ticks — which is what makes the
+		// unconditional `defer e.shutdownNVML()` in queryMetrics safe.
+		e.initNVMLForTick()
+		if e.nvmlInitialized {
+			t.Fatal("nvmlInitialized set despite init failure")
+		}
+		if want := "e.initNVML error: " + initErr.Error(); e.initNVMLError != want {
+			t.Fatalf("initNVMLError = %q, want %q", e.initNVMLError, want)
+		}
+		e.shutdownNVML()
+		e.initNVMLForTick()
+		if e.nvmlInitialized {
+			t.Fatal("nvmlInitialized set despite init failure")
+		}
+		e.shutdownNVML()
+
+		// Tick 3: init succeeds, error cleared, shutdown pairs with it.
+		e.initNVMLForTick()
+		if !e.nvmlInitialized {
+			t.Fatal("nvmlInitialized not set after init succeeded")
+		}
+		if e.initNVMLError != "" {
+			t.Fatalf("initNVMLError = %q after recovery, want empty", e.initNVMLError)
+		}
+		e.shutdownNVML()
+		if e.nvmlInitialized {
+			t.Fatal("nvmlInitialized still set after shutdown")
+		}
+		if inits != 3 {
+			t.Fatalf("init called %d times, want 3", inits)
+		}
+		if shutdowns != 1 {
+			t.Fatalf("shutdown called %d times, want 1 (only after successful init)", shutdowns)
+		}
+	})
+
+	t.Run("second init while initialized is a no-op", func(t *testing.T) {
+		// A second Init would bump NVML's refcount, and the single paired
+		// Shutdown would leave the library open past the tick — losing the
+		// dlclose-per-tick property.
+		e := newExporter()
+		inits, shutdowns := 0, 0
+		e.initNVMLFn = func() error { inits++; return nil }
+		e.shutdownNVMLFn = func() { shutdowns++ }
+
+		e.initNVMLForTick()
+		e.initNVMLForTick()
+		if inits != 1 {
+			t.Fatalf("init called %d times, want 1", inits)
+		}
+		e.shutdownNVML()
+		if shutdowns != 1 {
+			t.Fatalf("shutdown called %d times, want 1", shutdowns)
+		}
+	})
+}
+
+// TestSendMetricsLastErrorClearsOnSuccess covers the error-message lifecycle
+// of the send path: a failure records the message, a confirmed delivery
+// clears it, and the counter stays cumulative throughout. Without the clear,
+// a message from before a receiver restart rode on every payload forever —
+// the field read as an ongoing problem while sends were succeeding.
+func TestSendMetricsLastErrorClearsOnSuccess(t *testing.T) {
+	e := newXIDTestExporter()
+
+	// Failure path: counter bumps, message recorded.
+	e.recordSendMetricsError("client.NewClientConnection error: connection reset by peer")
+	if e.sendMetricsErrorCount != 1 {
+		t.Fatalf("sendMetricsErrorCount = %d, want 1", e.sendMetricsErrorCount)
+	}
+	if e.sendMetricsLastError == "" {
+		t.Fatal("sendMetricsLastError empty after a recorded failure")
+	}
+
+	// Success path (the clear sendMetrics performs after a confirmed
+	// delivery): message cleared, counter untouched.
+	e.lastMetricsMu.Lock()
+	e.clearSendMetricsLastError()
+	e.lastMetricsMu.Unlock()
+	if e.sendMetricsLastError != "" {
+		t.Fatalf("sendMetricsLastError = %q after successful send, want empty", e.sendMetricsLastError)
+	}
+	if e.sendMetricsErrorCount != 1 {
+		t.Fatalf("sendMetricsErrorCount = %d after successful send, want 1 (cumulative)", e.sendMetricsErrorCount)
+	}
+
+	// A later failure records again.
+	e.recordSendMetricsError("c.SendData error: frame too large")
+	if e.sendMetricsErrorCount != 2 {
+		t.Fatalf("sendMetricsErrorCount = %d, want 2", e.sendMetricsErrorCount)
+	}
+	if e.sendMetricsLastError != "c.SendData error: frame too large" {
+		t.Fatalf("sendMetricsLastError = %q, want the new failure message", e.sendMetricsLastError)
+	}
+}
 
 // TestRemoveStrings covers the helper that drains the XID buffer on a
 // successful send: only the lines a payload actually carried are retired, the

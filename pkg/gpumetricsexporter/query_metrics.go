@@ -49,15 +49,80 @@ func (e *GpuMetricsExporter) readInstanceID() (string, error) {
 func (e *GpuMetricsExporter) initNVML() error {
 	ret := nvml.Init()
 	if ret != nvml.SUCCESS {
-		err := fmt.Errorf("nvml init error %s", nvml.ErrorString(ret))
-		e.log.Error("nvml.Init", zap.Error(err))
-		return err
+		return fmt.Errorf("nvml init error %s", nvml.ErrorString(ret))
 	}
 	return nil
 }
 
-// shutdownNVML shuts down the NVML library
+// initNVMLForTick initializes NVML for one collection tick. NVML is
+// initialized and shut down around every tick rather than once for the
+// process lifetime, for two reasons:
+//
+//   - dlopen pins the first-loaded library: a driver upgrade inside the
+//     guest replaces libnvidia-ml.so.1 on disk, but a process holding an
+//     open handle keeps reading the pre-upgrade library (or failing with
+//     "Driver/library version mismatch") until it restarts. Shutdown
+//     dlclose()s the handle, so the next tick picks up the new library.
+//   - a failed init is retried on the next tick instead of leaving the
+//     exporter shipping empty metrics until the VM is restarted.
+//
+// nvmlInit/nvmlShutdown are refcounted and the dlopen/dlclose pair costs
+// microseconds, which is nothing at tick granularity.
+//
+// Idempotent: a call with NVML already initialized is a no-op. A second Init
+// would bump NVML's refcount, and the single paired Shutdown would then
+// leave the library open past this tick — silently losing the dlclose-per-
+// tick property this whole scheme exists for.
+func (e *GpuMetricsExporter) initNVMLForTick() {
+	if e.nvmlInitialized {
+		e.log.Warn("initNVMLForTick called with NVML already initialized")
+		return
+	}
+	err := e.initNVMLFn()
+	if err != nil {
+		e.initNVMLError = fmt.Sprintf("e.initNVML error: %v", err)
+		e.log.Error("e.initNVML", zap.Error(err))
+		e.nvmlInitialized = false
+		return
+	}
+	if e.initNVMLError != "" {
+		e.log.Info("nvml init recovered after previous failure",
+			zap.String("previous_error", e.initNVMLError))
+	}
+	e.initNVMLError = ""
+	e.nvmlInitialized = true
+}
+
+// shutdownNVML shuts down the NVML library, releasing the dlopen handle so a
+// library update on disk is not held hostage by this process.
+//
+// Idempotent, and safe after a failed initNVMLForTick: go-nvml's Shutdown
+// calls into the library before checking its own refcount, so a shutdown
+// with no library open is an unresolved cgo symbol — a SIGABRT that no
+// recover() can contain. The nvmlInitialized guard is what makes an
+// unconditional `defer e.shutdownNVML()` in queryMetrics safe: on a tick
+// where init failed it no-ops instead of aborting the process. That is the
+// normal failed-tick path, hence Debug, not a warning.
 func (e *GpuMetricsExporter) shutdownNVML() {
+	if !e.nvmlInitialized {
+		e.log.Debug("shutdownNVML skipped, NVML not initialized this tick")
+		return
+	}
+	e.nvmlInitialized = false
+	e.shutdownNVMLFn()
+}
+
+// shutdownNVMLReal is the production NVML shutdown behind shutdownNVMLFn.
+//
+// WARNING: go-nvml v0.13 mutates a package-global on load/close —
+// errorStringFunc is swapped in library.load() and reset in library.close()
+// with no synchronization. That is safe here only because every nvml.*
+// package-level call in this exporter happens on the query goroutine, the
+// same goroutine this runs on. Never call nvml package functions from
+// another goroutine (e.g. the send loop or a future consumer) while this
+// per-tick init/shutdown cycle is active: it would be a data race on that
+// global, and the race detector cannot see it across the cgo boundary.
+func (e *GpuMetricsExporter) shutdownNVMLReal() {
 	ret := nvml.Shutdown()
 	if ret != nvml.SUCCESS {
 		err := fmt.Errorf("nvml shutdown error %s", nvml.ErrorString(ret))
@@ -91,6 +156,15 @@ func (e *GpuMetricsExporter) getDeviceHandle(index int) (nvml.Device, error) {
 // errors. Unsupported NVML features silently no-op rather than failing the
 // whole tick.
 func (e *GpuMetricsExporter) queryMetrics() (*gpumetrics.GpuMetrics, error) {
+	// Initialize NVML for this tick and shut it down after collection (see
+	// initNVMLForTick/shutdownNVML): a fresh dlopen every tick picks up a
+	// library update on disk and retries a failed init instead of pinning
+	// the exporter to the driver state at process start. Both are guarded
+	// on nvmlInitialized, so the unconditional shutdown is a no-op on a
+	// tick whose init failed.
+	e.initNVMLForTick()
+	defer e.shutdownNVML()
+
 	metrics := gpumetrics.NewGpuMetrics()
 
 	instanceID, err := e.readInstanceID()

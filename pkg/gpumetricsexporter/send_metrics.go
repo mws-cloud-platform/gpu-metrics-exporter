@@ -12,7 +12,11 @@ import (
 // sendMetrics serializes m to the wire format and sends it to the host over a
 // fresh vsock connection, then sends an empty close-frame and closes the
 // connection. On failure it records the error (bumping the send-error counter
-// and storing the message). On success it drains the XID/SXID buffer: the lines
+// and storing the message). On success it clears the last send error — a
+// confirmed delivery is proof the channel works, and a stale message from
+// before a receiver restart would otherwise ride on every payload forever,
+// reading as an ongoing problem (the counter stays cumulative; only the
+// message is transient). It also drains the XID/SXID buffer: the lines
 // carried by m are marked delivered and dropped from the unsent queue so they
 // are not re-shipped on later ticks. The delta baseline (lastMetrics) is
 // maintained by queryMetrics from the last *collected* snapshot, not here.
@@ -46,13 +50,18 @@ func (e *GpuMetricsExporter) sendMetrics(m *gpumetrics.GpuMetrics) error {
 		return err
 	}
 
-	// Delivery confirmed: the XID/SXID lines this payload carried are now
-	// delivered, so retire them from the unsent buffer and remember them as
-	// sent to keep the overlapping dmesg window from re-shipping duplicates.
-	// Only the lines actually in m are drained; lines buffered after this
-	// payload was collected remain pending for the next tick.
+	// Delivery confirmed: clear the last send error so the field means
+	// "the channel is broken now" rather than "it was broken at some point"
+	// (recordSendMetricsError sets it back on the next failure), and retire
+	// the XID/SXID lines this payload carried from the unsent buffer and
+	// remember them as sent to keep the overlapping dmesg window from
+	// re-shipping duplicates. Only the lines actually in m are drained;
+	// lines buffered after this payload was collected remain pending for
+	// the next tick.
 	e.lastMetricsMu.Lock()
 	defer e.lastMetricsMu.Unlock()
+
+	e.clearSendMetricsLastError()
 
 	if len(m.XIDErrors.XIDErrors) > 0 {
 		if e.retiredXIDErrors == nil {
@@ -98,4 +107,15 @@ func (e *GpuMetricsExporter) recordSendMetricsError(msg string) {
 	defer e.lastMetricsMu.Unlock()
 	e.sendMetricsErrorCount++
 	e.sendMetricsLastError = msg
+}
+
+// clearSendMetricsLastError empties the last send error after a confirmed
+// delivery, so the field reports "the channel is broken now" rather than
+// "it was broken at some point". The counter is deliberately untouched: it
+// stays cumulative, so a consumer summing it still sees every failure that
+// ever happened.
+//
+// Callers must hold lastMetricsMu.
+func (e *GpuMetricsExporter) clearSendMetricsLastError() {
+	e.sendMetricsLastError = ""
 }
