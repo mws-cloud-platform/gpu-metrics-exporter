@@ -2,6 +2,7 @@ IMAGE_NAME  := gpu-metrics-exporter-builder
 CT_NAME := gpu-metrics-exporter-extractor
 BIN_DIR     := bin
 DIST_DIR    := dist
+DOCKER_IMAGE_NAME ?= gpu-metrics-exporter:latest
 # Deb version; empty -> scripts/build-deb.sh falls back to `git describe --tags --always`.
 VERSION     ?=
 # Pinned so `make lint` and CI run byte-identical checks. Must be built with a Go
@@ -9,7 +10,11 @@ VERSION     ?=
 # because go-nvml is cgo and needs a C compiler.
 GOLANGCI_IMAGE ?= golangci/golangci-lint:v2.13.1
 
-.PHONY: gpu-metrics-exporter gpu-metrics-receiver docker-build deb docker-test fmt vet lint test cover clean
+.PHONY: gpu-metrics-exporter gpu-metrics-receiver docker-build docker-image deb docker-test fmt vet lint test cover clean
+
+docker-image:
+	docker build --platform linux/amd64 --build-arg VERSION=$(VERSION) -f Dockerfile -t $(DOCKER_IMAGE_NAME) .
+
 
 gpu-metrics-exporter: cmd/gpu-metrics-exporter/main.go
 	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -o ./gpu-metrics-exporter cmd/gpu-metrics-exporter/main.go

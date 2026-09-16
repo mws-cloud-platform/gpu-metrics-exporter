@@ -352,6 +352,42 @@ Match on `index` rather than on position in the array.
 | `links[].errors_delta` | Map of error-counter type → per-tick change |
 | `links[].error` | Error message if a link query failed for some reason other than the counter being unavailable |
 
+## Kubernetes DaemonSet & NVIDIA GPU Operator
+
+`gpu-metrics-exporter` can run as a Kubernetes `DaemonSet` on GPU worker nodes (VMs with AF_VSOCK support).
+
+### Features
+- **NVIDIA GPU Operator compatibility**: automatically discovers `libnvidia-ml.so.1` across driver container paths (`/run/nvidia/driver/usr/lib/x86_64-linux-gnu`, `/run/nvidia/driver/usr/lib64`), container toolkit paths (`/usr/local/nvidia/lib64`), and standard host paths. Can be overridden via `NVML_LIB_PATH`.
+- **AF_VSOCK transport**: connects to `VMADDR_CID_HOST` (CID 2) via `/dev/vsock` mounted from the host.
+- **Node & hardware diagnostics**: reads `dmesg` (kernel ring buffer for XID/SXID errors) and inspects `nvidia-fabricmanager` via host `chroot`.
+- **Host instance identification**: mounts `/var/lib/cloud/data/instance-id` directly from the host.
+
+### Configuration
+
+The exporter supports configuration via both environment variables and CLI flags:
+
+| Environment Variable | CLI Flag | Default | Description |
+| --- | --- | --- | --- |
+| `SERVER_PORT` | `-serverPort` | `9999` | Destination vsock port on host CID 2 |
+| `TICK_PERIOD` | `-tickPeriod` | `60` | Collection interval in seconds |
+| `LOG_LEVEL` | `-logLevel` | `info` | Logging level (`debug`, `info`, `warn`, `error`) |
+| `NVML_LIB_PATH` | `-nvmlLibPath` | `""` (auto) | Explicit path to `libnvidia-ml.so.1` |
+| `INSTANCE_ID_PATH` | `-instanceIdPath` | `/var/lib/cloud/data/instance-id` | Path to cloud-init instance ID |
+| `HOST_ROOT` | `-hostRoot` | `/host` (if exists) else `/` | Host root filesystem mount point |
+
+### Deployment
+
+1. Build the container image:
+```bash
+make docker-image DOCKER_IMAGE_NAME=<registry>/gpu-metrics-exporter:<tag>
+docker push <registry>/gpu-metrics-exporter:<tag>
+```
+
+2. Apply the DaemonSet manifest:
+```bash
+kubectl apply -f deploy/daemonset.yaml
+```
+
 ## How to build
 ```bash
 make docker-build

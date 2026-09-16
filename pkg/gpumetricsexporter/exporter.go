@@ -6,6 +6,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/NVIDIA/go-nvml/pkg/nvml"
 	"go.mws.cloud/gpu-metrics-exporter/pkg/gpumetrics"
 	"go.uber.org/zap"
 )
@@ -14,10 +15,13 @@ import (
 // to, the collection interval, the build version stamped onto each payload, and
 // a logger.
 type GpuMetricsExporterConfig struct {
-	ServerPort int
-	Log        *zap.Logger
-	TickPeriod time.Duration
-	Version    string
+	ServerPort     int
+	Log            *zap.Logger
+	TickPeriod     time.Duration
+	Version        string
+	NvmlLibPath    string
+	InstanceIDPath string
+	HostRoot       string
 }
 
 // GpuMetricsExporter periodically collects GPU metrics via NVML and ships them
@@ -33,6 +37,7 @@ type GpuMetricsExporter struct {
 	startTime          int64
 	nvmlInitialized    bool
 	initNVMLError      string
+	nvmlClient         nvml.Interface
 	// initNVMLFn/shutdownNVMLFn are the NVML lifecycle calls behind
 	// initNVMLForTick/shutdownNVML, swappable in tests to drive the
 	// failure/retry/recovery paths without a GPU.
@@ -91,6 +96,10 @@ func NewGpuMetricsExporter(config GpuMetricsExporterConfig) *GpuMetricsExporter 
 	tickPeriod := config.TickPeriod
 	if tickPeriod <= 0 {
 		tickPeriod = 10 * time.Second // default to 10 seconds
+	}
+
+	if config.InstanceIDPath == "" {
+		config.InstanceIDPath = cloudInitInstanceIDFilePath
 	}
 
 	e := &GpuMetricsExporter{

@@ -37,7 +37,11 @@ const (
 )
 
 func (e *GpuMetricsExporter) readInstanceID() (string, error) {
-	data, err := os.ReadFile(cloudInitInstanceIDFilePath)
+	filePath := e.config.InstanceIDPath
+	if filePath == "" {
+		filePath = cloudInitInstanceIDFilePath
+	}
+	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return "", err
 	}
@@ -45,9 +49,28 @@ func (e *GpuMetricsExporter) readInstanceID() (string, error) {
 	return instanceID, nil
 }
 
-// initNVML initializes the NVML library
+// getNVML returns the active NVML interface or creates a default one if nil
+func (e *GpuMetricsExporter) getNVML() nvml.Interface {
+	if e.nvmlClient != nil {
+		return e.nvmlClient
+	}
+	return nvml.New()
+}
+
+// initNVML initializes the NVML library, discovering paths for NVIDIA GPU Operator
+// if a custom path was not specified.
 func (e *GpuMetricsExporter) initNVML() error {
-	ret := nvml.Init()
+	resolvedLibPath := FindNVMLLibraryPath(e.config.NvmlLibPath, e.config.HostRoot)
+	var opts []nvml.LibraryOption
+	if resolvedLibPath != "" {
+		e.log.Info("initializing NVML with library path", zap.String("path", resolvedLibPath))
+		opts = append(opts, nvml.WithLibraryPath(resolvedLibPath))
+	} else {
+		e.log.Info("initializing NVML with default system library")
+	}
+
+	e.nvmlClient = nvml.New(opts...)
+	ret := e.nvmlClient.Init()
 	if ret != nvml.SUCCESS {
 		return fmt.Errorf("nvml init error %s", nvml.ErrorString(ret))
 	}
@@ -123,6 +146,15 @@ func (e *GpuMetricsExporter) shutdownNVML() {
 // per-tick init/shutdown cycle is active: it would be a data race on that
 // global, and the race detector cannot see it across the cgo boundary.
 func (e *GpuMetricsExporter) shutdownNVMLReal() {
+	if e.nvmlClient != nil {
+		ret := e.nvmlClient.Shutdown()
+		if ret != nvml.SUCCESS {
+			err := fmt.Errorf("nvml shutdown error %s", nvml.ErrorString(ret))
+			e.log.Error("nvml.Shutdown", zap.Error(err))
+		}
+		e.nvmlClient = nil
+		return
+	}
 	ret := nvml.Shutdown()
 	if ret != nvml.SUCCESS {
 		err := fmt.Errorf("nvml shutdown error %s", nvml.ErrorString(ret))
@@ -132,7 +164,7 @@ func (e *GpuMetricsExporter) shutdownNVMLReal() {
 
 // getDeviceCount returns the number of NVIDIA GPUs
 func (e *GpuMetricsExporter) getDeviceCount() (int, error) {
-	count, ret := nvml.DeviceGetCount()
+	count, ret := e.getNVML().DeviceGetCount()
 	if ret != nvml.SUCCESS {
 		err := fmt.Errorf("unable to get device count: %v", nvml.ErrorString(ret))
 		e.log.Error("nvml.DeviceGetCount", zap.Error(err))
@@ -143,7 +175,7 @@ func (e *GpuMetricsExporter) getDeviceCount() (int, error) {
 
 // getDeviceHandle returns the device handle for a given GPU index
 func (e *GpuMetricsExporter) getDeviceHandle(index int) (nvml.Device, error) {
-	device, ret := nvml.DeviceGetHandleByIndex(index)
+	device, ret := e.getNVML().DeviceGetHandleByIndex(index)
 	if ret != nvml.SUCCESS {
 		return nil, fmt.Errorf("unable to get device at index %d: %v", index, nvml.ErrorString(ret))
 	}
@@ -428,7 +460,7 @@ func (e *GpuMetricsExporter) collectPCIInfo(device nvml.Device, info *gpumetrics
 
 // collectDriverInfo collects GPU driver information
 func (e *GpuMetricsExporter) collectDriverInfo(info *gpumetrics.GPUInfo) {
-	if driverVersion, ret := nvml.SystemGetDriverVersion(); ret == nvml.SUCCESS {
+	if driverVersion, ret := e.getNVML().SystemGetDriverVersion(); ret == nvml.SUCCESS {
 		info.DriverVersion = driverVersion
 	}
 }
@@ -882,7 +914,13 @@ func parseEventReasons(events uint64) string {
 
 func (e *GpuMetricsExporter) runCommand(name string, args ...string) (int, string) {
 	e.log.Debug("run", zap.String("name", name), zap.Strings("args", args))
-	cmd := exec.Command(name, args...)
+	var cmd *exec.Cmd
+	if name == "systemctl" && e.config.HostRoot != "" && e.config.HostRoot != "/" {
+		// If running in a container with host root mounted, run systemctl via host chroot
+		cmd = exec.Command("chroot", append([]string{e.config.HostRoot, "systemctl"}, args...)...)
+	} else {
+		cmd = exec.Command(name, args...)
+	}
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		if exitError, ok := err.(*exec.ExitError); ok {
