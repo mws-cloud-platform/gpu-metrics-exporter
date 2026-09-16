@@ -385,7 +385,7 @@ docker push <registry>/gpu-metrics-exporter:<tag>
 
 2. Apply the DaemonSet manifest:
 ```bash
-kubectl apply -f deploy/daemonset.yaml
+kubectl apply -f k8s/daemonset.yaml
 ```
 
 ## How to build
