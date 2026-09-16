@@ -1,16 +1,12 @@
 package main
 
 import (
-	"os"
 	"testing"
 )
 
 func TestGetEnv(t *testing.T) {
 	key := "TEST_GPU_METRICS_STR"
-	if err := os.Setenv(key, "custom_val"); err != nil {
-		t.Fatal(err)
-	}
-	defer os.Unsetenv(key)
+	t.Setenv(key, "custom_val")
 
 	if got := getEnv(key, "default"); got != "custom_val" {
 		t.Fatalf("expected custom_val, got %s", got)
@@ -23,19 +19,14 @@ func TestGetEnv(t *testing.T) {
 
 func TestGetEnvInt(t *testing.T) {
 	key := "TEST_GPU_METRICS_INT"
-	if err := os.Setenv(key, "1234"); err != nil {
-		t.Fatal(err)
-	}
-	defer os.Unsetenv(key)
+	t.Setenv(key, "1234")
 
 	if got := getEnvInt(key, 9999); got != 1234 {
 		t.Fatalf("expected 1234, got %d", got)
 	}
 
 	// Invalid int string returns default
-	if err := os.Setenv(key, "invalid_num"); err != nil {
-		t.Fatal(err)
-	}
+	t.Setenv(key, "invalid_num")
 	if got := getEnvInt(key, 9999); got != 9999 {
 		t.Fatalf("expected 9999, got %d", got)
 	}
