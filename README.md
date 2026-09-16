@@ -408,12 +408,12 @@ The build image installs packages from Ubuntu's own archives. Where those are
 slow or blocked, substitute a mirror:
 
 ```bash
-docker build --platform linux/amd64 -f docker/builder.Dockerfile \
+docker build --platform linux/amd64 -f docker/deb.Dockerfile \
   --build-arg APT_MIRROR=http://mirror.yandex.ru/ubuntu .
 ```
 
 The Go toolchain tarball is checksum-verified during the build; `GO_SHA256` in
-`docker/builder.Dockerfile` must be updated whenever `GO_VERSION` is.
+`docker/deb.Dockerfile` must be updated whenever `GO_VERSION` is.
 
 CI (`.github/workflows/build.yml`) runs the test suite (`make docker-test`, in a linux/amd64 container), then builds the binaries on every commit / pull request (uploaded as a workflow artifact, not published), and runs the tests + builds + publishes the `.deb` packages to a GitHub Release on a tag push, using the tag name as the version.
 

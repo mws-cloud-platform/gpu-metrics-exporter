@@ -13,7 +13,7 @@ GOLANGCI_IMAGE ?= golangci/golangci-lint:v2.13.1
 .PHONY: gpu-metrics-exporter gpu-metrics-receiver docker-build docker-image deb docker-test fmt vet lint test cover clean
 
 docker-image:
-	docker build --platform linux/amd64 --build-arg VERSION=$(VERSION) -f docker/exporter.Dockerfile -t $(DOCKER_IMAGE_NAME) .
+	docker build --platform linux/amd64 --build-arg VERSION=$(VERSION) -f docker/k8s.Dockerfile -t $(DOCKER_IMAGE_NAME) .
 
 
 gpu-metrics-exporter: cmd/gpu-metrics-exporter/main.go
@@ -25,7 +25,7 @@ gpu-metrics-receiver: cmd/gpu-metrics-receiver/main.go
 
 
 docker-build:
-	docker build --platform linux/amd64 --build-arg VERSION=$(VERSION) -f docker/builder.Dockerfile -t $(IMAGE_NAME) .
+	docker build --platform linux/amd64 --build-arg VERSION=$(VERSION) -f docker/deb.Dockerfile -t $(IMAGE_NAME) .
 	mkdir -p $(BIN_DIR)
 	@docker rm -f $(CT_NAME) >/dev/null 2>&1 || true
 	docker create --name $(CT_NAME) $(IMAGE_NAME)
@@ -42,7 +42,7 @@ deb: docker-build
 
 
 docker-test:
-	docker build --platform linux/amd64 -f docker/builder.Dockerfile --target builder -t $(IMAGE_NAME)-test .
+	docker build --platform linux/amd64 -f docker/deb.Dockerfile --target builder -t $(IMAGE_NAME)-test .
 	docker run --rm --platform linux/amd64 $(IMAGE_NAME)-test go test -v -count=1 ./...
 
 
@@ -68,7 +68,7 @@ test:
 # Coverage across all packages. Runs in the build container so linux-only tests
 # (see pkg/vsock/common/deadline_vsock_test.go) are included in the figure.
 cover:
-	docker build --platform linux/amd64 -f docker/builder.Dockerfile --target builder -t $(IMAGE_NAME)-test .
+	docker build --platform linux/amd64 -f docker/deb.Dockerfile --target builder -t $(IMAGE_NAME)-test .
 	docker run --rm --platform linux/amd64 $(IMAGE_NAME)-test \
 		sh -c 'go test -count=1 -coverprofile=/tmp/cover.out ./... >/dev/null && go tool cover -func=/tmp/cover.out | tail -1'
 
