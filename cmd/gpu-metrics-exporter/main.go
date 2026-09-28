@@ -19,43 +19,62 @@ import (
 
 var version string
 
-func getEnv(key, defaultVal string) string {
-	if val, ok := os.LookupEnv(key); ok && val != "" {
+func getEnv(primaryKey, fallbackKey, defaultVal string) string {
+	if val, ok := os.LookupEnv(primaryKey); ok && val != "" {
 		return val
+	}
+	if fallbackKey != "" {
+		if val, ok := os.LookupEnv(fallbackKey); ok && val != "" {
+			return val
+		}
 	}
 	return defaultVal
 }
 
-func getEnvInt(key string, defaultVal int) int {
-	if val, ok := os.LookupEnv(key); ok && val != "" {
-		if i, err := strconv.Atoi(val); err == nil {
-			return i
+func getEnvInt(primaryKey, fallbackKey string, defaultVal int) (int, error) {
+	valStr := ""
+	keyUsed := ""
+	if val, ok := os.LookupEnv(primaryKey); ok && val != "" {
+		valStr = val
+		keyUsed = primaryKey
+	} else if fallbackKey != "" {
+		if val, ok := os.LookupEnv(fallbackKey); ok && val != "" {
+			valStr = val
+			keyUsed = fallbackKey
 		}
 	}
-	return defaultVal
+	if valStr == "" {
+		return defaultVal, nil
+	}
+	i, err := strconv.Atoi(valStr)
+	if err != nil {
+		return 0, fmt.Errorf("invalid integer value %q for environment variable %s: %w", valStr, keyUsed, err)
+	}
+	return i, nil
 }
 
 func main() {
-	defaultPort := getEnvInt("SERVER_PORT", 9999)
-	defaultTick := getEnvInt("TICK_PERIOD", 60)
-	defaultLogLevel := getEnv("LOG_LEVEL", "info")
-	defaultNvmlPath := getEnv("NVML_LIB_PATH", "")
-	defaultInstanceIDPath := getEnv("INSTANCE_ID_PATH", "/var/lib/cloud/data/instance-id")
-	defaultHostRoot := getEnv("HOST_ROOT", "")
-	if defaultHostRoot == "" {
-		if fi, err := os.Stat("/host"); err == nil && fi.IsDir() {
-			defaultHostRoot = "/host"
-		} else {
-			defaultHostRoot = "/"
-		}
+	defaultPort, err := getEnvInt("GPU_METRICS_EXPORTER_SERVER_PORT", "SERVER_PORT", 1234)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Configuration error: %v\n", err)
+		os.Exit(1)
 	}
+	defaultTick, err := getEnvInt("GPU_METRICS_EXPORTER_TICK_PERIOD", "TICK_PERIOD", 10)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Configuration error: %v\n", err)
+		os.Exit(1)
+	}
+	defaultLogLevel := getEnv("GPU_METRICS_EXPORTER_LOG_LEVEL", "LOG_LEVEL", "info")
+	defaultNvmlPath := getEnv("GPU_METRICS_EXPORTER_NVML_LIB_PATH", "NVML_LIB_PATH", "")
+	defaultInstanceIDPath := getEnv("GPU_METRICS_EXPORTER_INSTANCE_ID_PATH", "INSTANCE_ID_PATH", "/var/lib/cloud/data/instance-id")
+	defaultHostRoot := getEnv("GPU_METRICS_EXPORTER_HOST_ROOT", "HOST_ROOT", "/")
 
-	port := flag.Int("serverPort", defaultPort, "server vsock port (env: SERVER_PORT)")
-	periodSecs := flag.Int("tickPeriod", defaultTick, "metrics gathering period in seconds (env: TICK_PERIOD)")
-	logLevelStr := flag.String("logLevel", defaultLogLevel, "log level: debug, info, warn, error (env: LOG_LEVEL)")
-	nvmlLibPath := flag.String("nvmlLibPath", defaultNvmlPath, "path to libnvidia-ml.so (env: NVML_LIB_PATH)")
-	instanceIdPath := flag.String("instanceIdPath", defaultInstanceIDPath, "path to cloud-init instance-id file (env: INSTANCE_ID_PATH)")
-	hostRoot := flag.String("hostRoot", defaultHostRoot, "path to host root filesystem mount (env: HOST_ROOT)")
+	port := flag.Int("serverPort", defaultPort, "server vsock port (env: GPU_METRICS_EXPORTER_SERVER_PORT, SERVER_PORT)")
+	periodSecs := flag.Int("tickPeriod", defaultTick, "metrics gathering period in seconds (env: GPU_METRICS_EXPORTER_TICK_PERIOD, TICK_PERIOD)")
+	logLevelStr := flag.String("logLevel", defaultLogLevel, "log level: debug, info, warn, error (env: GPU_METRICS_EXPORTER_LOG_LEVEL, LOG_LEVEL)")
+	nvmlLibPath := flag.String("nvmlLibPath", defaultNvmlPath, "path to libnvidia-ml.so (env: GPU_METRICS_EXPORTER_NVML_LIB_PATH, NVML_LIB_PATH)")
+	instanceIdPath := flag.String("instanceIdPath", defaultInstanceIDPath, "path to cloud-init instance-id file (env: GPU_METRICS_EXPORTER_INSTANCE_ID_PATH, INSTANCE_ID_PATH)")
+	hostRoot := flag.String("hostRoot", defaultHostRoot, "path to host root filesystem mount (env: GPU_METRICS_EXPORTER_HOST_ROOT, HOST_ROOT)")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
 

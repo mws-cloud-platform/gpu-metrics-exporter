@@ -69,4 +69,21 @@ func TestFindNVMLLibraryPath(t *testing.T) {
 			t.Fatalf("expected %q, got %q", nonExistent, got)
 		}
 	})
+
+	t.Run("finds path using mocked candidates and file existence without touching host", func(t *testing.T) {
+		containerCandidates := []string{"/mock/container/libnvidia-ml.so.1"}
+		hostCandidates := []string{"/mock/host/libnvidia-ml.so.1"}
+
+		existing := map[string]bool{
+			"/custom/host/mock/host/libnvidia-ml.so.1": true,
+		}
+		mockExists := func(path string) bool {
+			return existing[path]
+		}
+
+		got := FindNVMLLibraryPathWithFS("", "/custom/host", containerCandidates, hostCandidates, mockExists)
+		if want := "/custom/host/mock/host/libnvidia-ml.so.1"; got != want {
+			t.Fatalf("expected %q, got %q", want, got)
+		}
+	})
 }

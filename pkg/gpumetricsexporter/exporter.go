@@ -38,6 +38,9 @@ type GpuMetricsExporter struct {
 	nvmlInitialized    bool
 	initNVMLError      string
 	nvmlClient         nvml.Interface
+	lastNvmlLibPath    string
+	nvmlPathLogged     bool
+	onVersionMismatch  func(nvml.Return)
 	// initNVMLFn/shutdownNVMLFn are the NVML lifecycle calls behind
 	// initNVMLForTick/shutdownNVML, swappable in tests to drive the
 	// failure/retry/recovery paths without a GPU.
@@ -112,6 +115,10 @@ func NewGpuMetricsExporter(config GpuMetricsExporterConfig) *GpuMetricsExporter 
 	// failure/retry/recovery paths without a GPU.
 	e.initNVMLFn = e.initNVML
 	e.shutdownNVMLFn = e.shutdownNVMLReal
+	e.onVersionMismatch = func(ret nvml.Return) {
+		e.log.Fatal("NVML driver/library version mismatch detected, exiting for supervisor restart",
+			zap.String("error", nvml.ErrorString(ret)))
+	}
 	// Initialize seqno to 0
 	e.seqno.Store(0)
 	return e
@@ -163,8 +170,10 @@ func (e *GpuMetricsExporter) sendMetricsLoop(ctx context.Context) {
 // Run starts the exporter: launches the send goroutine and runs the query
 // loop in the calling goroutine until the context is done. NVML is
 // initialized and shut down around every collection tick (see
-// initNVMLForTick), so a failed init is retried and a library update on
-// disk is picked up without restarting the exporter.
+// initNVMLForTick), so a failed init is retried on the next tick and open
+// handles to device files are released between ticks. If a driver upgrade
+// causes a driver/library version mismatch, the exporter exits with a non-zero
+// code so its supervisor (systemd or kubelet) can restart it with a fresh address space.
 func (e *GpuMetricsExporter) Run(ctx context.Context) error {
 	defer e.queryMetricsTicker.Stop()
 
