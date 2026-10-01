@@ -50,6 +50,41 @@ jobs:
       - name: Build linux/amd64 binaries (Docker)
         run: make docker-build
 
+      - name: Sign gpu-metrics-exporter (pci-attest)
+        id: sign
+        # Pull requests run unreviewed code, so they never get the operator's
+        # signature (fork PRs get no secrets anyway). Without the secret a
+        # branch artifact stays unsigned with a warning; a release refuses.
+        if: github.event_name != 'pull_request'
+        env:
+          ATTEST_SIGNING_KEY: ${{ secrets.ATTEST_SIGNING_KEY }}
+        run: |
+          if [ -z "$ATTEST_SIGNING_KEY" ]; then
+            echo "::warning::ATTEST_SIGNING_KEY secret is not set; the exporter artifact is unsigned"
+            exit 0
+          fi
+          key="$RUNNER_TEMP/attest-signing-key.pem"
+          trap 'rm -f "$key"' EXIT
+          (umask 077 && printf '%s\n' "$ATTEST_SIGNING_KEY" > "$key")
+          make sign SIGN_KEY="$key"
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Verify the pci-attest signature
+        # Against the public key the hosts' QEMU is started with (pubkey=),
+        # not one derived from the signing key: that is what catches a CI key
+        # that does not match the fleet's.
+        if: steps.sign.outputs.signed == 'true'
+        env:
+          ATTEST_PUBLIC_KEY: ${{ secrets.ATTEST_PUBLIC_KEY }}
+        run: |
+          if [ -z "$ATTEST_PUBLIC_KEY" ]; then
+            echo "::warning::ATTEST_PUBLIC_KEY secret is not set; the signature is not verified"
+            exit 0
+          fi
+          pub="$RUNNER_TEMP/attest-public-key"
+          printf '%s\n' "$ATTEST_PUBLIC_KEY" > "$pub"
+          make verify-signature VERIFY_KEY="$pub"
+
       - name: Verify binary
         run: |
           file bin/gpu-metrics-exporter bin/gpu-metrics-receiver
@@ -81,9 +116,39 @@ jobs:
         run: make docker-test
 
       - name: Build .deb packages
-        # make deb runs docker-build (binaries get version via ldflags) then
+        # make deb runs docker-build (binaries get version via ldflags), signs
+        # the exporter for pci-attest with the operator key from the
+        # ATTEST_SIGNING_KEY secret (scripts/sign-elf.py), then runs
         # scripts/build-deb.sh, producing dist/<pkg>_<VERSION>_amd64.deb.
-        run: make deb VERSION="${VERSION}"
+        # A release never ships unsigned: the device would ignore every
+        # payload from it.
+        env:
+          ATTEST_SIGNING_KEY: ${{ secrets.ATTEST_SIGNING_KEY }}
+        run: |
+          if [ -z "$ATTEST_SIGNING_KEY" ]; then
+            echo "::error::ATTEST_SIGNING_KEY secret is not set; refusing to release an unsigned exporter"
+            exit 1
+          fi
+          key="$RUNNER_TEMP/attest-signing-key.pem"
+          trap 'rm -f "$key"' EXIT
+          (umask 077 && printf '%s\n' "$ATTEST_SIGNING_KEY" > "$key")
+          make deb VERSION="${VERSION}" SIGN_KEY="$key"
+
+      - name: Verify the pci-attest signature of the packaged exporter
+        # What ships is the binary inside the .deb, so that is the one checked
+        # -- against the hosts' public key, before anything is uploaded.
+        env:
+          ATTEST_PUBLIC_KEY: ${{ secrets.ATTEST_PUBLIC_KEY }}
+        run: |
+          if [ -z "$ATTEST_PUBLIC_KEY" ]; then
+            echo "::error::ATTEST_PUBLIC_KEY secret is not set; refusing to release an unverified exporter"
+            exit 1
+          fi
+          pub="$RUNNER_TEMP/attest-public-key"
+          printf '%s\n' "$ATTEST_PUBLIC_KEY" > "$pub"
+          root="$RUNNER_TEMP/deb-root"
+          dpkg-deb -x "dist/gpu-metrics-exporter_${VERSION}_amd64.deb" "$root"
+          make verify-signature VERIFY_KEY="$pub" BIN_DIR="$root/usr/local/bin"
 
       - name: Inspect packages
         run: |

@@ -48,8 +48,14 @@ COPY internal/ internal/
 COPY pkg/ pkg/
 COPY cmd/ cmd/
 
+# The exporter must stay dynamically linked: go-nvml leaves the nvml* symbols
+# for ld.so to bind after it dlopen()s libnvidia-ml, and a -static binary has no
+# ld.so, so its first NVML call jumps to address 0. ET_EXEC (-no-pie) with the
+# code in its own segment (-z separate-code) is what pkg/attest's signed note
+# needs (see scripts/sign-elf.py). Double quotes outside: the shell must expand
+# ${VERSION}.
 RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
-    go build -ldflags "-X main.version=${VERSION} -s -w" -o /gpu-metrics-exporter ./cmd/gpu-metrics-exporter/
+    go build -trimpath -ldflags "-linkmode external -extldflags '-no-pie -Wl,-z,separate-code' -X main.version=${VERSION} -s -w" -o /gpu-metrics-exporter ./cmd/gpu-metrics-exporter/
 
 RUN CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
     go build -ldflags "-X main.version=${VERSION} -s -w" -o /gpu-metrics-receiver ./cmd/gpu-metrics-receiver/

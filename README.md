@@ -65,6 +65,26 @@ Connections over a limit are closed immediately. The read deadline is what stops
 a guest from opening a connection, sending a frame header, and going silent to
 pin a goroutine and an fd until the process exits.
 
+### Attested channel (pci-attest)
+The exporter also hands every payload to the QEMU `pci-attest` device (PCI id
+`1234:11e9`), when the guest has one. The device measures the calling process
+against a manifest of its code pages that is signed with the operator key and
+embedded in the binary itself (`.note.attest`), and keeps the payload only if
+they match. The host reads the last accepted payload over QMP (`qom-get
+last-payload` / `last-seq`) and can compare it with what arrived over vsock.
+The guest is never told whether a payload was kept.
+
+The exporter opens the device once at startup; a guest without it runs without
+the channel. The device reports its protocol version in `STATUS[31:16]`; the
+exporter speaks v1 and refuses any other (including a QEMU too old to report
+one), logging one error at startup and running without the channel. Each send
+waits at most 3 s for the device, and it never holds up the vsock send. Source
+code location: `pkg/attest`.
+
+The device vouches that the signed binary produced the bytes, not that they are
+true: `libnvidia-ml` and the `dmesg`/`systemctl` the exporter shells out to are
+not measured, and a guest with root can feed it false inputs.
+
 ## Exported metrics
 
 On every tick (default 10 s; the deployed systemd unit uses 60 s) the exporter
@@ -411,6 +431,28 @@ make deb VERSION=2026.06.08-2
 ```
 This writes `dist/gpu-metrics-exporter_<version>_amd64.deb` and `dist/gpu-metrics-receiver_<version>_amd64.deb`. If `VERSION` is omitted, it falls back to `git describe --tags --always`.
 
+The pci-attest device accepts payloads only from a signed exporter (an unsigned
+one runs normally, but the device ignores it). Signing patches the manifest into
+the binary in place, after the build:
+```bash
+make docker-build && make sign SIGN_KEY=operator.pem
+make deb VERSION=2026.06.08-2 SIGN_KEY=operator.pem   # signs, then packages
+```
+`ATTEST_VERSION` (default `1`) is the monotonic release number signed into the
+manifest; the host refuses anything below its `min-version`, so raising it
+retires older builds. The host needs only the public key:
+```bash
+openssl rsa -in operator.pem -pubout -RSAPublicKey_out -outform DER -out operator-pub.der
+```
+To check a signed binary the way the device will (the note where the device
+finds it, the signature against that public key, the manifest against the
+binary's own code pages, the signed version), without running it:
+```bash
+make verify-signature VERIFY_KEY=operator-pub.der
+```
+Keep the exporter dynamically linked: go-nvml relies on `ld.so` to bind the NVML
+symbols after `dlopen`, so a `-static` build crashes on its first NVML call.
+
 Other targets: `make docker-test` (test suite in the build container), `make lint`
 (golangci-lint, pinned to the same image CI uses), and `make cover` (coverage
 across all packages, including the Linux-only tests).
@@ -427,6 +469,17 @@ The Go toolchain tarball is checksum-verified during the build; `GO_SHA256` in
 `docker/Dockerfile` must be updated whenever `GO_VERSION` is.
 
 CI (`.github/workflows/build.yml`) runs the test suite (`make docker-test`, in a linux/amd64 container), then builds the binaries on every commit / pull request (uploaded as a workflow artifact, not published), and runs the tests + builds + publishes the `.deb` packages to a GitHub Release on a tag push, using the tag name as the version.
+
+CI signs the exporter with the key in the `ATTEST_SIGNING_KEY` repository secret
+(the PEM itself: `gh secret set ATTEST_SIGNING_KEY < operator.pem`), then
+verifies the signature against the `ATTEST_PUBLIC_KEY` secret — the public key
+the hosts' QEMU is started with, not one derived from the signing key, so a CI
+key that does not match the fleet's fails the build. A secret holds text, so
+store the DER as base64 (`base64 < operator-pub.der | gh secret set
+ATTEST_PUBLIC_KEY`) or a PEM. A tag build refuses to release without either
+secret and verifies the binary inside the `.deb` before uploading anything;
+branch builds sign and verify when the secrets are set, with a warning
+otherwise, and pull requests are never signed.
 
 ## License
 This project is licensed under the [Apache License 2.0](LICENSE).
