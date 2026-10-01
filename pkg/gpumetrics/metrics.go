@@ -294,10 +294,14 @@ type NvFabricManagerStatus struct {
 // the cumulative number of lines the exporter had to discard because that
 // pending buffer overflowed — non-zero means XID errors were lost, and the
 // kernel log on the guest is the only remaining record of them.
+// KernelLogLostCount is the cumulative number of kernel log records, of any
+// kind, overwritten in the ring buffer before the exporter could read them —
+// non-zero means any XID among them is gone from the guest as well.
 type XIDErrors struct {
-	Error        string   `json:"error"`
-	XIDErrors    []string `json:"xid_errors"`
-	DroppedCount int64    `json:"dropped_count"`
+	Error              string   `json:"error"`
+	XIDErrors          []string `json:"xid_errors"`
+	DroppedCount       int64    `json:"dropped_count"`
+	KernelLogLostCount int64    `json:"kernel_log_lost_count"`
 }
 
 // NVMLLibrary is the exporter's measurement of the libnvidia-ml it reads every

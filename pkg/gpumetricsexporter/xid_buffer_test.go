@@ -1,11 +1,15 @@
 package gpumetricsexporter
 
 import (
+	"errors"
 	"fmt"
+	"path/filepath"
 	"slices"
+	"syscall"
 	"testing"
 	"time"
 
+	"go.mws.cloud/gpu-metrics-exporter/pkg/gpumetrics"
 	"go.uber.org/zap"
 )
 
@@ -86,164 +90,169 @@ func TestTrimUnsentXIDErrorsAccumulatesDropCount(t *testing.T) {
 	}
 }
 
-// TestPruneRetiredXIDErrorsByAge covers the bound that keeps the retired-line
-// set from growing for the life of the process: dmesg lines carry timestamps,
-// so every line is distinct and nothing would ever be removed without it.
-func TestPruneRetiredXIDErrorsByAge(t *testing.T) {
+// newKmsgTestExporter builds an exporter whose kernel log is l, read with the
+// clock stopped at *now since boot.
+func newKmsgTestExporter(l *fakeKernelLog, now *time.Duration) *GpuMetricsExporter {
 	e := newXIDTestExporter()
-	now := time.Now()
-	retention := 140 * time.Second
+	e.config.TickPeriod = time.Minute
+	e.kmsg = newTestKmsgReader(l, e.log, now)
+	return e
+}
 
-	e.retiredXIDErrors = map[string]time.Time{
-		"fresh":      now.Add(-10 * time.Second),
-		"borderline": now.Add(-retention + time.Second),
-		"expired":    now.Add(-retention - time.Second),
-		"long gone":  now.Add(-time.Hour),
-		"just sent":  now,
+// TestGetXIDErrorsAdmitsOnlyGenuineLines runs the lines the dmesg-based filter
+// took for XIDs through the whole collection path, next to genuine ones.
+func TestGetXIDErrorsAdmitsOnlyGenuineLines(t *testing.T) {
+	l := &fakeKernelLog{}
+	l.add(kmsgErrPri, 941*time.Second, xid79Text)
+	l.add(1<<3|3, 942*time.Second, "NVRM: Xid (PCI:0000:00:05): 79, kmsg-injection-test") // user.err: written into /dev/kmsg
+	l.add(kmsgErrPri, 943*time.Second, oomPrefix+" total-vm:412192kB")
+	l.add(6, 944*time.Second, "NVRM: loading NVIDIA UNIX x86_64 Kernel Module  550.54.15")
+	l.add(kmsgErrPri, 945*time.Second, sxidText)
+	now := 1000 * time.Second
+	e := newKmsgTestExporter(l, &now)
+
+	got, err := e.getXIDErrors()
+	if err != nil {
+		t.Fatalf("getXIDErrors: %v", err)
 	}
-
-	e.pruneRetiredXIDErrors(now, retention)
-
-	for _, keep := range []string{"fresh", "borderline", "just sent"} {
-		if _, ok := e.retiredXIDErrors[keep]; !ok {
-			t.Errorf("%q was pruned but is still inside the retention window", keep)
-		}
-	}
-	for _, drop := range []string{"expired", "long gone"} {
-		if _, ok := e.retiredXIDErrors[drop]; ok {
-			t.Errorf("%q outlived the retention window but was not pruned", drop)
-		}
+	if want := []string{"[  941.000000] " + xid79Text, "[  945.000000] " + sxidText}; !slices.Equal(got, want) {
+		t.Fatalf("got %q\nwant %q", got, want)
 	}
 }
 
-// TestPruneRetiredXIDErrorsSizeBackstop covers the cap that applies when a single
-// dmesg window carries more distinct lines than age-based pruning retires. The
-// newest records must survive, since those are the ones still able to reappear
-// in the dmesg look-back window and be re-shipped as duplicates.
-func TestPruneRetiredXIDErrorsSizeBackstop(t *testing.T) {
-	e := newXIDTestExporter()
-	now := time.Now()
-
-	const excess = 10
-	e.retiredXIDErrors = make(map[string]time.Time, maxRetiredXIDErrors+excess)
-	for i := 0; i < maxRetiredXIDErrors+excess; i++ {
-		// Higher i == more recent.
-		e.retiredXIDErrors[fmt.Sprintf("line %d", i)] = now.Add(time.Duration(i) * time.Millisecond)
+// TestGetXIDErrorsReshipsUntilDelivered covers the delivery contract on top of
+// the reader: a line rides on every payload until one carrying it is
+// delivered, and is read from the kernel log only once.
+func TestGetXIDErrorsReshipsUntilDelivered(t *testing.T) {
+	l := &fakeKernelLog{}
+	l.add(kmsgErrPri, 990*time.Second, xid79Text)
+	now := 1000 * time.Second
+	e := newKmsgTestExporter(l, &now)
+	tick := func() []string {
+		t.Helper()
+		got, err := e.getXIDErrors()
+		if err != nil {
+			t.Fatalf("getXIDErrors: %v", err)
+		}
+		return got
 	}
 
-	// Retention long enough that nothing is pruned by age; only the cap acts.
-	e.pruneRetiredXIDErrors(now, time.Hour)
-
-	if len(e.retiredXIDErrors) != maxRetiredXIDErrors {
-		t.Fatalf("set size = %d, want %d", len(e.retiredXIDErrors), maxRetiredXIDErrors)
-	}
-	// The `excess` oldest entries are the ones that should be gone.
-	for i := 0; i < excess; i++ {
-		if _, ok := e.retiredXIDErrors[fmt.Sprintf("line %d", i)]; ok {
-			t.Errorf("oldest record %q survived the size backstop", fmt.Sprintf("line %d", i))
+	first := "[  990.000000] " + xid79Text
+	for range 2 { // the host is unreachable: the line rides again, once
+		if got := tick(); !slices.Equal(got, []string{first}) {
+			t.Fatalf("got %q, want %q", got, []string{first})
 		}
 	}
-	newest := fmt.Sprintf("line %d", maxRetiredXIDErrors+excess-1)
-	if _, ok := e.retiredXIDErrors[newest]; !ok {
-		t.Errorf("newest record %q was evicted", newest)
+
+	l.add(kmsgErrPri, 1050*time.Second, sxidText)
+	payload := tick()
+	if want := []string{first, "[ 1050.000000] " + sxidText}; !slices.Equal(payload, want) {
+		t.Fatalf("got %q, want %q", payload, want)
+	}
+
+	// What sendMetrics does once that payload is delivered.
+	e.unsentXIDErrors = removeStrings(e.unsentXIDErrors, payload)
+	if got := tick(); got != nil {
+		t.Fatalf("after delivery got %q, want nothing", got)
 	}
 }
 
-// TestPruneRetiredXIDErrorsEmpty guards the nil-map path: pruning runs every tick,
-// including before any XID has ever been delivered.
-func TestPruneRetiredXIDErrorsEmpty(t *testing.T) {
-	e := newXIDTestExporter()
-	e.pruneRetiredXIDErrors(time.Now(), time.Minute)
-	if len(e.retiredXIDErrors) != 0 {
-		t.Fatalf("set size = %d, want 0", len(e.retiredXIDErrors))
+// TestGetXIDErrorsShipsPendingWhenReadFails covers a tick whose kernel log read
+// fails: the lines already pending still ship, next to the error.
+func TestGetXIDErrorsShipsPendingWhenReadFails(t *testing.T) {
+	l := &fakeKernelLog{}
+	l.add(kmsgErrPri, 990*time.Second, xid79Text)
+	now := 1000 * time.Second
+	e := newKmsgTestExporter(l, &now)
+	if _, err := e.getXIDErrors(); err != nil {
+		t.Fatalf("getXIDErrors: %v", err)
+	}
+
+	l.files[0].readErr = syscall.EIO
+	got, err := e.getXIDErrors()
+	if !errors.Is(err, syscall.EIO) {
+		t.Fatalf("getXIDErrors error = %v, want EIO", err)
+	}
+	if want := []string{"[  990.000000] " + xid79Text}; !slices.Equal(got, want) {
+		t.Fatalf("got %q, want %q", got, want)
 	}
 }
 
-// TestTrimUnsentXIDErrorsRetiresDropped is the regression guard for the
-// re-admission bug: evicted lines must be recorded as retired. A line that is
-// neither pending nor retired looks fresh to the next getXIDErrors pass while
-// it is still inside the overlapping dmesg window.
-func TestTrimUnsentXIDErrorsRetiresDropped(t *testing.T) {
-	e := newXIDTestExporter()
-
-	const overflow = 3
-	for i := 0; i < maxUnsentXIDErrors+overflow; i++ {
-		e.unsentXIDErrors = append(e.unsentXIDErrors, fmt.Sprintf("Xid line %d", i))
-	}
-
-	e.trimUnsentXIDErrors()
-
-	for i := 0; i < overflow; i++ {
-		line := fmt.Sprintf("Xid line %d", i)
-		if _, retired := e.retiredXIDErrors[line]; !retired {
-			t.Errorf("dropped line %q was not retired; the next tick would re-admit it", line)
-		}
-	}
-	// Surviving lines are still pending, so they must NOT be marked retired.
-	if _, retired := e.retiredXIDErrors[fmt.Sprintf("Xid line %d", overflow)]; retired {
-		t.Error("a line still in the pending buffer was marked retired")
-	}
-}
-
-// TestXIDBufferNoReadmissionThrash reproduces the full multi-tick failure the
-// retire-on-drop fix prevents. It models the deployed tickPeriod=60 case: an
-// XID storm larger than the buffer, a host that stays unreachable, and a dmesg
-// window that keeps re-reporting every line.
-//
-// Without retiring dropped lines: tick 1 keeps the newest 128 and drops the
-// oldest, tick 2 re-admits those dropped lines at the tail and evicts the ones
-// that are now at the head — which are newer — so DroppedCount climbs on every
-// tick and the buffer ends up holding the OLDEST lines instead of the newest.
-func TestXIDBufferNoReadmissionThrash(t *testing.T) {
-	e := newXIDTestExporter()
-
+// TestXIDStormOverflowCountedOnce covers an XID storm larger than the pending
+// buffer while the host is unreachable: the overflow is dropped oldest-first
+// and counted once, and later ticks, with nothing new in the kernel log, drop
+// and count nothing more. With the dmesg window every tick re-read the same
+// lines, so a dropped line had to be remembered to keep it from coming back.
+func TestXIDStormOverflowCountedOnce(t *testing.T) {
 	const storm = maxUnsentXIDErrors + 72
-	candidates := make([]string, storm)
-	for i := range candidates {
-		candidates[i] = fmt.Sprintf("Xid line %03d", i)
+	line := func(i int) string { return fmt.Sprintf("NVRM: Xid (PCI:0000:3b:00): 74, line %03d", i) }
+	l := &fakeKernelLog{}
+	for i := range storm {
+		l.add(kmsgErrPri, 990*time.Second, line(i))
 	}
+	now := 1000 * time.Second
+	e := newKmsgTestExporter(l, &now)
 
-	// admit mirrors getXIDErrors' admission rules without shelling out to dmesg.
-	admit := func() {
-		for _, line := range candidates {
-			if _, retired := e.retiredXIDErrors[line]; retired {
-				continue
-			}
-			if slices.Contains(e.unsentXIDErrors, line) {
-				continue
-			}
-			e.unsentXIDErrors = append(e.unsentXIDErrors, line)
+	for tick := 1; tick <= 5; tick++ {
+		if _, err := e.getXIDErrors(); err != nil {
+			t.Fatalf("getXIDErrors: %v", err)
 		}
-		e.trimUnsentXIDErrors()
-	}
-
-	admit()
-	afterFirst := e.xidErrorsDropped
-	if afterFirst != storm-maxUnsentXIDErrors {
-		t.Fatalf("first tick dropped %d, want %d", afterFirst, storm-maxUnsentXIDErrors)
-	}
-
-	// Every subsequent tick sees the same dmesg window and must be a no-op:
-	// nothing new to admit, so nothing further to drop.
-	for tick := 2; tick <= 5; tick++ {
-		admit()
-		if e.xidErrorsDropped != afterFirst {
-			t.Fatalf("tick %d: xidErrorsDropped grew to %d (want %d) — dropped lines are being re-admitted and re-counted",
-				tick, e.xidErrorsDropped, afterFirst)
+		if e.xidErrorsDropped != storm-maxUnsentXIDErrors {
+			t.Fatalf("tick %d: xidErrorsDropped = %d, want %d", tick, e.xidErrorsDropped, storm-maxUnsentXIDErrors)
 		}
 	}
-
-	// The buffer must still hold the NEWEST lines, not the re-admitted oldest.
 	if len(e.unsentXIDErrors) != maxUnsentXIDErrors {
 		t.Fatalf("buffer len = %d, want %d", len(e.unsentXIDErrors), maxUnsentXIDErrors)
 	}
-	wantHead := fmt.Sprintf("Xid line %03d", storm-maxUnsentXIDErrors)
-	if e.unsentXIDErrors[0] != wantHead {
-		t.Errorf("buffer head = %q, want %q — oldest-first eviction was inverted",
-			e.unsentXIDErrors[0], wantHead)
+	if want := "[  990.000000] " + line(storm-maxUnsentXIDErrors); e.unsentXIDErrors[0] != want {
+		t.Errorf("buffer head = %q, want %q: the oldest lines go first", e.unsentXIDErrors[0], want)
 	}
-	wantTail := fmt.Sprintf("Xid line %03d", storm-1)
-	if got := e.unsentXIDErrors[len(e.unsentXIDErrors)-1]; got != wantTail {
-		t.Errorf("buffer tail = %q, want %q — the newest line must survive", got, wantTail)
+	if want := "[  990.000000] " + line(storm-1); e.unsentXIDErrors[maxUnsentXIDErrors-1] != want {
+		t.Errorf("buffer tail = %q, want %q: the newest line must survive", e.unsentXIDErrors[maxUnsentXIDErrors-1], want)
+	}
+}
+
+// TestQueryMetricsReportsXIDErrors pins the wiring into the payload: the
+// pending lines next to a read error, and the count of records lost.
+func TestQueryMetricsReportsXIDErrors(t *testing.T) {
+	p := newFakeProcess(t)
+	e := NewGpuMetricsExporter(GpuMetricsExporterConfig{
+		Log:            zap.NewNop(),
+		TickPeriod:     time.Minute,
+		InstanceIDPath: filepath.Join(p.root, "instance-id"),
+	})
+	e.initNVMLFn = func() error { return errors.New("no NVML here") }
+	e.nvmlLib = p.inspector()
+	l := &fakeKernelLog{capacity: 2}
+	l.add(kmsgErrPri, 990*time.Second, xid79Text)
+	now := 1000 * time.Second
+	e.kmsg = newTestKmsgReader(l, e.log, &now)
+	want := []string{"[  990.000000] " + xid79Text}
+
+	tick := func() *gpumetrics.XIDErrors {
+		t.Helper()
+		m, err := e.queryMetrics()
+		if err != nil {
+			t.Fatalf("queryMetrics: %v", err)
+		}
+		return &m.XIDErrors
+	}
+
+	if x := tick(); !slices.Equal(x.XIDErrors, want) || x.Error != "" || x.KernelLogLostCount != 0 {
+		t.Fatalf("first tick: %+v", x)
+	}
+
+	// Three records arrive and the ring buffer keeps two: one is lost.
+	for range 3 {
+		l.add(6, 995*time.Second, "noise")
+	}
+	if x := tick(); x.KernelLogLostCount != 1 {
+		t.Fatalf("after the ring buffer wrapped: %+v, want kernel_log_lost_count 1", x)
+	}
+
+	l.files[0].readErr = syscall.EIO
+	x := tick()
+	if x.Error == "" || !slices.Equal(x.XIDErrors, want) || x.KernelLogLostCount != 1 {
+		t.Fatalf("tick with a failed read: %+v, want the error, the pending line and the loss count", x)
 	}
 }

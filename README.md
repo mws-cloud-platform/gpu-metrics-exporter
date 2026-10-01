@@ -37,7 +37,7 @@ The GPU metrics exporter is a guest binary that is a vsock client.
 It knows the peer (some fixed port and host CID = 2).
 
 The GPU metrics exporter periodically queries GPU metrics using [go-nvml](https://github.com/NVIDIA/go-nvml)
-(with `nvidia-smi`/`dmesg`/`systemctl` shelling-out for a few things) and sends them to the host.
+(plus the kernel log for XID/SXID errors and `systemctl` for fabric manager health) and sends them to the host.
 
 Source code location: `cmd/gpu-metrics-exporter` and `pkg/gpumetricsexporter`.
 
@@ -82,8 +82,9 @@ waits at most 3 s for the device, and it never holds up the vsock send. Source
 code location: `pkg/attest`.
 
 The device vouches that the signed binary produced the bytes, not that they are
-true: `libnvidia-ml` and the `dmesg`/`systemctl` the exporter shells out to are
-not measured, and a guest with root can feed it false inputs.
+true: `libnvidia-ml`, the `systemctl` the exporter shells out to and the guest
+kernel whose log it reads are not measured, and a guest with root can feed it
+false inputs.
 
 ## Exported metrics
 
@@ -191,24 +192,28 @@ fabrics such as H100), queried via `systemctl`.
 
 ### XID / SXid errors (`xid_errors`)
 
-Recent GPU error lines from the kernel log (`dmesg` within `tickPeriod + 10 s`),
-filtered for `xid`/`sxid`.
+GPU (Xid) and NVSwitch (SXid) error lines from the kernel log, read from
+`/dev/kmsg`. A record counts only if the kernel logged it (facility `kern`;
+whatever userspace writes into `/dev/kmsg` is filed as `user`), at `err` level
+or worse, and its message starts with `NVRM: Xid (` or `nvidia-nvswitchN: SXid (`.
+Lines are formatted as `dmesg` prints them: `[seconds.micros] message`.
 
-A line is buffered as soon as it is observed and re-shipped on every payload
-until a payload carrying it is confirmed delivered, so neither a transient send
-failure nor a send stall longer than the look-back window can lose an error.
-Once delivered, a line is remembered long enough that the overlapping window
-cannot re-ship it as a duplicate. The pending buffer is capped; if it overflows
-(only reachable when the host has been unreachable for a long time) the oldest
-lines are discarded and counted in `dropped_count`, because an unbounded buffer
-would eventually push the frame past the 64 KiB vsock limit and stop delivery
-altogether.
+The exporter keeps `/dev/kmsg` open and reads each record once, by sequence
+number; on start it looks back `tickPeriod + 10 s`. A line is buffered as soon
+as it is read and re-shipped on every payload until a payload carrying it is
+confirmed delivered, so a transient send failure cannot lose an error, and the
+pending lines ship even on a tick where reading the kernel log failed. The
+pending buffer is capped; if it overflows (only reachable when the host has been
+unreachable for a long time) the oldest lines are discarded and counted in
+`dropped_count`, because an unbounded buffer would eventually push the frame
+past the 64 KiB vsock limit and stop delivery altogether.
 
 | Field | Description |
 | --- | --- |
-| `xid_errors` | List of matching `dmesg` lines pending or newly delivered |
+| `xid_errors` | XID/SXID lines read from the kernel log and not yet confirmed delivered |
 | `dropped_count` | Cumulative lines discarded on buffer overflow; non-zero means XID errors were lost and only the guest's kernel log still has them |
-| `error` | Error message if the `dmesg` invocation failed |
+| `kernel_log_lost_count` | Cumulative kernel log records, of any kind, overwritten in the ring buffer before the exporter read them; non-zero means any XID errors among them are lost, from the guest as well |
+| `error` | Error reading the kernel log on this tick: no `/dev/kmsg`, no `CAP_SYSLOG`, or something other than the kernel log device at that path |
 
 ### NVML library (`nvml_library`)
 

@@ -2,7 +2,6 @@ package gpumetricsexporter
 
 import (
 	"fmt"
-	"time"
 
 	"go.mws.cloud/gpu-metrics-exporter/pkg/gpumetrics"
 	"go.mws.cloud/gpu-metrics-exporter/pkg/vsock/client"
@@ -58,29 +57,15 @@ func (e *GpuMetricsExporter) sendMetrics(m *gpumetrics.GpuMetrics) error {
 
 	// Delivery confirmed: clear the last send error so the field means
 	// "the channel is broken now" rather than "it was broken at some point"
-	// (recordSendMetricsError sets it back on the next failure), and retire
-	// the XID/SXID lines this payload carried from the unsent buffer and
-	// remember them as sent to keep the overlapping dmesg window from
-	// re-shipping duplicates. Only the lines actually in m are drained;
-	// lines buffered after this payload was collected remain pending for
-	// the next tick.
+	// (recordSendMetricsError sets it back on the next failure), and drop the
+	// XID/SXID lines this payload carried from the unsent buffer. Only the
+	// lines actually in m are drained; lines buffered after this payload was
+	// collected remain pending for the next tick.
 	e.lastMetricsMu.Lock()
 	defer e.lastMetricsMu.Unlock()
 
 	e.clearSendMetricsLastError()
-
-	if len(m.XIDErrors.XIDErrors) > 0 {
-		if e.retiredXIDErrors == nil {
-			e.retiredXIDErrors = make(map[string]time.Time, len(m.XIDErrors.XIDErrors))
-		}
-		// Stamp the delivery time so pruneRetiredXIDErrors can drop the record
-		// once the line can no longer reappear in the dmesg look-back window.
-		now := time.Now()
-		for _, line := range m.XIDErrors.XIDErrors {
-			e.retiredXIDErrors[line] = now
-		}
-		e.unsentXIDErrors = removeStrings(e.unsentXIDErrors, m.XIDErrors.XIDErrors)
-	}
+	e.unsentXIDErrors = removeStrings(e.unsentXIDErrors, m.XIDErrors.XIDErrors)
 	return nil
 }
 
