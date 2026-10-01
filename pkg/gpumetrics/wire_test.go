@@ -18,6 +18,14 @@ func sampleGpuMetrics() *GpuMetrics {
 	}
 	m.NvFabricManagerStatus = NvFabricManagerStatus{Active: true, Enabled: true, NotDegraded: true}
 	m.XIDErrors = XIDErrors{XIDErrors: []string{"Xid 79 on GPU 0", "SXid 13"}, DroppedCount: 4}
+	m.NVMLLibrary = NVMLLibrary{
+		Error:      "partial",
+		Path:       "/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.550.54.15",
+		SHA256:     "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+		Size:       2097152,
+		HashedFrom: "mapping",
+		Problems:   []string{"LD_PRELOAD is set: /tmp/libevil.so", "unexpected library mapped: /tmp/libevil.so"},
+	}
 	m.GpuDeviceCount = 2
 	m.Gpus = []GPUInfo{
 		{

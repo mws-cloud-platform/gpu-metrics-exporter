@@ -210,6 +210,34 @@ altogether.
 | `dropped_count` | Cumulative lines discarded on buffer overflow; non-zero means XID errors were lost and only the guest's kernel log still has them |
 | `error` | Error message if the `dmesg` invocation failed |
 
+### NVML library (`nvml_library`)
+
+pci-attest vouches for the exporter's own code, not for `libnvidia-ml`, which
+every GPU number is read through: a guest with root can replace that library, or
+preload another that overrides its functions, and have the attested exporter
+report invented numbers. No check inside the guest can rule that out, so the
+exporter judges nothing; each tick it measures what is actually mapped into its
+process and reports it, and the host decides what to trust:
+
+- compare `sha256` with the known builds of the driver version that
+  `gpu_info[].driver_version` names (NVIDIA's packages, or the fleet majority:
+  a thousand VMs on one driver version reporting one digest, and one reporting
+  another, is the anomaly);
+- treat a non-empty `problems` as a reason to distrust the payload's GPU numbers.
+
+| Field | Description |
+| --- | --- |
+| `path` | The mapped `libnvidia-ml` as the kernel names it (symlinks resolved; ` (deleted)` appended when the file was replaced on disk after loading, as a driver upgrade does). Empty when NVML did not load — `exporter_info.init_nvml_error` says why |
+| `sha256`, `size` | Digest and length of the mapped file |
+| `hashed_from` | `mapping`: read through `/proc/self/map_files`, the very inode in use. `path`: the exporter lacked `CAP_SYS_ADMIN` for that and read the file at `path` |
+| `problems` | What a healthy exporter process does not have: `LD_PRELOAD`, `LD_AUDIT` or `LD_LIBRARY_PATH` set; a non-empty `/etc/ld.so.preload`; a tracer attached; an executable mapping that is neither the exporter, the C runtime nor `libnvidia-ml` and its own `libnvidia-*` siblings; a `libnvidia-ml` outside the system library directories, or with a file or parent directory not owned by root or writable by group or others. Empty when none was seen |
+| `error` | Set when the measurement itself failed; the other fields are then partial |
+
+What it cannot see: a modified NVIDIA kernel module (the open GPU kernel modules
+make that easy for root on a guest without Secure Boot and lockdown), or code
+injected into the exporter after a tick's check. Numbers that anything important
+depends on are better taken on the host.
+
 ### Per-GPU metrics (`gpu_info[]`)
 
 One entry per detected GPU. `error` is set and the remaining fields are left

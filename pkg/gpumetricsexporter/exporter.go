@@ -72,6 +72,12 @@ type GpuMetricsExporter struct {
 	// openAttestFn is the open behind it, swappable in tests.
 	attestDev    attester
 	openAttestFn func() (attester, error)
+	// nvmlLib measures the libnvidia-ml mapped into the process for each
+	// payload's nvml_library; lastNVMLLibraryReport is what was last logged,
+	// so a finding is logged when it changes rather than every tick. Both
+	// belong to the query goroutine.
+	nvmlLib               *nvmlLibraryInspector
+	lastNVMLLibraryReport string
 }
 
 const (
@@ -122,6 +128,7 @@ func NewGpuMetricsExporter(config GpuMetricsExporterConfig) *GpuMetricsExporter 
 	e.initNVMLFn = e.initNVML
 	e.shutdownNVMLFn = e.shutdownNVMLReal
 	e.openAttestFn = openAttestDevice
+	e.nvmlLib = newNVMLLibraryInspector(config)
 	e.onVersionMismatch = func(ret nvml.Return) {
 		e.log.Fatal("NVML driver/library version mismatch detected, exiting for supervisor restart",
 			zap.String("error", nvml.ErrorString(ret)))
