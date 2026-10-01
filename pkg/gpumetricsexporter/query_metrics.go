@@ -285,6 +285,10 @@ func (e *GpuMetricsExporter) queryMetrics() (*gpumetrics.GpuMetrics, error) {
 		}
 	}
 
+	// After collection, with NVML still loaded: what was mapped while the
+	// numbers above were read.
+	metrics.NVMLLibrary = e.inspectNVMLLibrary()
+
 	status, err := e.checkFabricManager()
 	if err != nil {
 		metrics.NvFabricManagerStatus.Error = fmt.Sprintf("e.checkFabricManager error: %v", err)

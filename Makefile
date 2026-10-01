@@ -10,15 +10,30 @@ VERSION     ?= $(shell git describe --tags --always 2>/dev/null || echo "")
 # toolchain >= go.mod's `go` directive; the Debian image (not -alpine) is required
 # because go-nvml is cgo and needs a C compiler.
 GOLANGCI_IMAGE ?= golangci/golangci-lint:v2.13.1
+# pci-attest signing (scripts/sign-elf.py). ATTEST_VERSION is the monotonic
+# release number signed into the manifest: the host refuses anything below its
+# min-version. It comes from the ATTEST_VERSION file, so a release signs with
+# the number in its own tagged commit -- re-releasing old code yields the old
+# number, which the floor still refuses. Raise it in the commit that fixes what
+# the hosts' min-version is raised to refuse out; never lower it. A command-line
+# ATTEST_VERSION=N overrides it for local experiments only.
+# SIGN_KEY is the operator's RSA private key (PEM); without it `make deb`
+# packages an unsigned exporter, whose sends the device ignores. VERIFY_KEY is
+# the matching public key as the hosts' QEMU gets it (pubkey=): operator-pub.der,
+# PEM, or base64 of the DER.
+ATTEST_VERSION := $(shell cat ATTEST_VERSION 2>/dev/null)
+SIGN_KEY       ?=
+VERIFY_KEY     ?=
+CHECK_ATTEST_VERSION = case "$(ATTEST_VERSION)" in ''|*[!0-9]*) echo "error: ATTEST_VERSION must be a non-negative integer (see the ATTEST_VERSION file), not '$(ATTEST_VERSION)'" >&2; exit 1;; esac
 
-.PHONY: gpu-metrics-exporter gpu-metrics-receiver docker-build docker-image deb docker-test fmt vet lint test cover clean
+.PHONY: gpu-metrics-exporter gpu-metrics-receiver docker-build docker-image sign verify-signature deb package docker-test fmt vet lint test cover clean
 
 docker-image:
 	docker build --platform linux/amd64 --build-arg VERSION=$(VERSION) --target exporter -f $(DOCKERFILE) -t $(DOCKER_IMAGE_NAME) .
 
 
 gpu-metrics-exporter: cmd/gpu-metrics-exporter/main.go
-	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -o ./gpu-metrics-exporter cmd/gpu-metrics-exporter/main.go
+	CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags '-linkmode external -extldflags "-no-pie -Wl,-z,separate-code"' -o ./gpu-metrics-exporter cmd/gpu-metrics-exporter/main.go
 
 
 gpu-metrics-receiver: cmd/gpu-metrics-receiver/main.go
@@ -35,8 +50,38 @@ docker-build:
 	docker rm $(CT_NAME) >/dev/null 2>&1
 
 
+# Sign bin/gpu-metrics-exporter in place: hash its code pages and patch the
+# signed manifest into the reserved .note.attest. Runs after docker-build;
+# nothing may modify the binary afterwards, or its pages stop matching.
+sign:
+	@if [ -z "$(SIGN_KEY)" ]; then echo "error: set SIGN_KEY=<operator RSA private key, PEM>" >&2; exit 1; fi
+	@$(CHECK_ATTEST_VERSION)
+	python3 scripts/sign-elf.py --key "$(SIGN_KEY)" -n gpu-metrics-exporter --version $(ATTEST_VERSION) $(BIN_DIR)/gpu-metrics-exporter
+
+
+# Check the signed exporter in BIN_DIR the way the pci-attest device will:
+# the note through the program headers, the signature against VERIFY_KEY, the
+# manifest against the binary's own code pages, and ATTEST_VERSION.
+verify-signature:
+	@if [ -z "$(VERIFY_KEY)" ]; then echo "error: set VERIFY_KEY=<operator public key: operator-pub.der, PEM or base64>" >&2; exit 1; fi
+	@$(CHECK_ATTEST_VERSION)
+	python3 scripts/sign-elf.py --verify "$(VERIFY_KEY)" -n gpu-metrics-exporter --version $(ATTEST_VERSION) $(BIN_DIR)/gpu-metrics-exporter
+
+
 # Build both .deb packages from bin/ via dpkg-deb + the debian/*/DEBIAN templates.
+# With SIGN_KEY set, the exporter is signed before it is packaged.
 deb: docker-build
+ifneq ($(strip $(SIGN_KEY)),)
+	$(MAKE) sign
+else
+	@echo "warning: SIGN_KEY is not set, packaging an unsigned gpu-metrics-exporter" >&2
+endif
+	$(MAKE) package
+
+
+# Package bin/ as it stands, without rebuilding it: the release job signs
+# between docker-build and this, so the key is only around for that one step.
+package:
 	@mkdir -p $(DIST_DIR)
 	scripts/build-deb.sh gpu-metrics-exporter "$(VERSION)"
 	scripts/build-deb.sh gpu-metrics-receiver "$(VERSION)"

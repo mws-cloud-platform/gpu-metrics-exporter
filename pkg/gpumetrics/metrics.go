@@ -300,9 +300,43 @@ type XIDErrors struct {
 	DroppedCount int64    `json:"dropped_count"`
 }
 
+// NVMLLibrary is the exporter's measurement of the libnvidia-ml it reads every
+// GPU number through, and of anything placed to intercept it. pci-attest
+// vouches for the exporter's own code, not for that library: a guest with root
+// can swap it, or preload another that overrides its functions, and have the
+// attested exporter report invented numbers. Inside the guest no check can rule
+// that out, so the exporter judges nothing -- it measures what is actually
+// mapped into it and reports that. The host decides: SHA256 against the known
+// builds of the driver version gpu_info[].driver_version names, and Problems as
+// a reason to distrust this payload's GPU numbers.
+type NVMLLibrary struct {
+	// Error is set when the measurement itself failed; the other fields are
+	// then partial.
+	Error string `json:"error"`
+	// Path is the mapped library as the kernel names it: symlinks resolved,
+	// with " (deleted)" appended when the file has been replaced on disk since
+	// it was loaded (a driver upgrade does that). Empty when no libnvidia-ml
+	// is mapped -- exporter_info.init_nvml_error then says why.
+	Path string `json:"path"`
+	// SHA256 is the hex digest of the mapped file; Size is its length.
+	SHA256 string `json:"sha256"`
+	Size   int64  `json:"size"`
+	// HashedFrom is "mapping" when SHA256 was read through the mapping itself
+	// (/proc/self/map_files: the very inode in use, whatever the path holds
+	// now) or "path" when the exporter lacked the capability for that and
+	// read the file at Path instead.
+	HashedFrom string `json:"hashed_from"`
+	// Problems lists what has no business in a healthy exporter process: an
+	// LD_PRELOAD/LD_AUDIT/LD_LIBRARY_PATH, a non-empty /etc/ld.so.preload, a
+	// tracer, a library mapped that is neither the C runtime nor
+	// libnvidia-ml's own, a libnvidia-ml outside the system library
+	// directories or writable by anyone but root. Empty means none was seen.
+	Problems []string `json:"problems"`
+}
+
 // GpuMetrics is the top-level payload exchanged between the guest exporter and
 // the host receiver: provenance, exporter health, fabric-manager status, XID
-// errors, and one GPUInfo entry per detected GPU.
+// errors, the NVML library measurement, and one GPUInfo entry per detected GPU.
 type GpuMetrics struct {
 	// WireVersion is the format version the *exporter* spoke, not the shape of
 	// this struct: NewGpuMetricsFromBytes always returns the current shape,
@@ -316,6 +350,7 @@ type GpuMetrics struct {
 	ExporterInfo          ExporterInfo          `json:"exporter_info"`
 	NvFabricManagerStatus NvFabricManagerStatus `json:"nv_fabric_manager_status"`
 	XIDErrors             XIDErrors             `json:"xid_errors"`
+	NVMLLibrary           NVMLLibrary           `json:"nvml_library"`
 	GpuDeviceCount        int                   `json:"gpu_device_count"`
 	Gpus                  []GPUInfo             `json:"gpu_info"`
 }

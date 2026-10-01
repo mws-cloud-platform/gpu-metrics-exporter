@@ -4,5 +4,10 @@
 bin/
 dist/
 
+# pci-attest keys (scripts/gen-attest-keys.sh, make sign SIGN_KEY=...): never
+# commit the operator key; operator-pub.der goes to the hosts, not the repo
+*.pem
+*.der
+
 # Claude Code local settings (personal, not shared)
 .claude/settings.local.json

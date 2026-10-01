@@ -1,8 +1,15 @@
 name: build
 
-# Run tests, then build linux/amd64 binaries on every branch push / MR (not published).
-# On a tag push, run tests then build .deb packages with the version taken from
-# the tag (tags look like 2026.06.08-2) and attach them to a GitHub Release.
+# Run tests, then build linux/amd64 binaries on every branch push / MR (not
+# published, and not signed for pci-attest). On a tag push, run tests, then
+# build, sign and verify the exporter and build .deb packages with the version
+# taken from the tag (tags look like 2026.06.08-2), attached to a GitHub Release.
+#
+# The pci-attest operator key is a secret of the `release` environment, never
+# of the repository: any workflow pushed on any branch can read a repository
+# secret. The environment admits tag runs only and holds each one for a
+# reviewer's approval (scripts/gen-attest-keys.sh sets it up), so a writer
+# tagging a commit with a doctored workflow cannot reach the key unseen.
 on:
   push:
     branches:
@@ -63,10 +70,13 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  # ── tag: build .deb packages with the version from the tag ──
+  # ── tag: build, sign and package with the version from the tag ──
   debs:
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-22.04
+    # Where the pci-attest keys live (see the top of this file). The run waits
+    # here for a reviewer's approval before any step starts.
+    environment: release
     # Only this job publishes; it needs write to create the Release.
     permissions:
       contents: write
@@ -80,10 +90,47 @@ jobs:
         # container used to build the .deb packages.
         run: make docker-test
 
+      - name: Build linux/amd64 binaries (Docker)
+        # Binaries get the version via ldflags.
+        run: make docker-build VERSION="${VERSION}"
+
+      - name: Sign gpu-metrics-exporter (pci-attest)
+        # The private key exists only for this step: written owner-only,
+        # used by scripts/sign-elf.py, removed on exit. A release never ships
+        # unsigned: the device would ignore every payload from it.
+        env:
+          ATTEST_SIGNING_KEY: ${{ secrets.ATTEST_SIGNING_KEY }}
+        run: |
+          if [ -z "$ATTEST_SIGNING_KEY" ]; then
+            echo "::error::ATTEST_SIGNING_KEY is not set in the release environment; refusing to release an unsigned exporter"
+            exit 1
+          fi
+          key="$RUNNER_TEMP/attest-signing-key.pem"
+          trap 'rm -f "$key"' EXIT
+          (umask 077 && printf '%s\n' "$ATTEST_SIGNING_KEY" > "$key")
+          make sign SIGN_KEY="$key"
+
       - name: Build .deb packages
-        # make deb runs docker-build (binaries get version via ldflags) then
-        # scripts/build-deb.sh, producing dist/<pkg>_<VERSION>_amd64.deb.
-        run: make deb VERSION="${VERSION}"
+        # Packages bin/ as it stands -- signed -- without rebuilding it,
+        # producing dist/<pkg>_<VERSION>_amd64.deb.
+        run: make package VERSION="${VERSION}"
+
+      - name: Verify the pci-attest signature of the packaged exporter
+        # What ships is the binary inside the .deb, so that is the one checked:
+        # against the public key the hosts' QEMU is started with (pubkey=), not
+        # one derived from the signing key, before anything is uploaded.
+        env:
+          ATTEST_PUBLIC_KEY: ${{ secrets.ATTEST_PUBLIC_KEY }}
+        run: |
+          if [ -z "$ATTEST_PUBLIC_KEY" ]; then
+            echo "::error::ATTEST_PUBLIC_KEY is not set in the release environment; refusing to release an unverified exporter"
+            exit 1
+          fi
+          pub="$RUNNER_TEMP/attest-public-key"
+          printf '%s\n' "$ATTEST_PUBLIC_KEY" > "$pub"
+          root="$RUNNER_TEMP/deb-root"
+          dpkg-deb -x "dist/gpu-metrics-exporter_${VERSION}_amd64.deb" "$root"
+          make verify-signature VERIFY_KEY="$pub" BIN_DIR="$root/usr/local/bin"
 
       - name: Inspect packages
         run: |
@@ -104,8 +151,12 @@ jobs:
           retention-days: 30
 
       - name: Attach packages to GitHub Release
+        # The notes lead with the pci-attest manifest version the exporter was
+        # signed with (the tagged commit's ATTEST_VERSION, checked above), so
+        # raising the hosts' min-version can be matched against releases.
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release create "${VERSION}" --title "${VERSION}" --generate-notes --verify-tag dist/*.deb \
+          gh release create "${VERSION}" --title "${VERSION}" --generate-notes --verify-tag \
+            --notes "pci-attest manifest version: $(cat ATTEST_VERSION)" dist/*.deb \
             || gh release upload "${VERSION}" dist/*.deb --clobber

@@ -11,17 +11,31 @@ import (
 
 // sendMetrics serializes m to the wire format and sends it to the host over a
 // fresh vsock connection, then sends an empty close-frame and closes the
-// connection. On failure it records the error (bumping the send-error counter
-// and storing the message). On success it clears the last send error — a
-// confirmed delivery is proof the channel works, and a stale message from
-// before a receiver restart would otherwise ride on every payload forever,
-// reading as an ongoing problem (the counter stays cumulative; only the
-// message is transient). It also drains the XID/SXID buffer: the lines
-// carried by m are marked delivered and dropped from the unsent queue so they
-// are not re-shipped on later ticks. The delta baseline (lastMetrics) is
-// maintained by queryMetrics from the last *collected* snapshot, not here.
+// connection. Before connecting it submits the same bytes to the pci-attest
+// device, if one is open (sendAttested): the host reads that copy over QMP,
+// not vsock, so it goes out even when the vsock connection fails, and its
+// wait is bounded by attestSendTimeout. On a vsock failure it records the
+// error (bumping the send-error counter and storing the message). On success
+// it clears the last send error — a confirmed delivery is proof the channel
+// works, and a stale message from before a receiver restart would otherwise
+// ride on every payload forever, reading as an ongoing problem (the counter
+// stays cumulative; only the message is transient). It also drains the
+// XID/SXID buffer: the lines carried by m are marked delivered and dropped
+// from the unsent queue so they are not re-shipped on later ticks. The delta
+// baseline (lastMetrics) is maintained by queryMetrics from the last
+// *collected* snapshot, not here.
 func (e *GpuMetricsExporter) sendMetrics(m *gpumetrics.GpuMetrics) error {
 	e.log.Debug("sendMetrics", zap.Any("metrics", m))
+
+	data, err := m.ToBytes()
+	if err != nil {
+		e.recordSendMetricsError(fmt.Sprintf("m.ToBytes error: %v", err))
+		e.log.Error("Marshal", zap.Error(err))
+		return err
+	}
+	e.log.Debug("sendMetrics", zap.Int("data.len", len(data)))
+
+	e.sendAttested(data)
 
 	c, err := client.NewClientConnection(e.log, e.config.ServerPort)
 	if err != nil {
@@ -34,14 +48,6 @@ func (e *GpuMetricsExporter) sendMetrics(m *gpumetrics.GpuMetrics) error {
 		_ = c.SendData(make([]byte, 0))
 		_ = c.Close()
 	}()
-
-	data, err := m.ToBytes()
-	if err != nil {
-		e.recordSendMetricsError(fmt.Sprintf("m.ToBytes error: %v", err))
-		e.log.Error("Marshal", zap.Error(err))
-		return err
-	}
-	e.log.Debug("sendMetrics", zap.Int("data.len", len(data)))
 
 	err = c.SendData(data)
 	if err != nil {

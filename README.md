@@ -65,6 +65,26 @@ Connections over a limit are closed immediately. The read deadline is what stops
 a guest from opening a connection, sending a frame header, and going silent to
 pin a goroutine and an fd until the process exits.
 
+### Attested channel (pci-attest)
+The exporter also hands every payload to the QEMU `pci-attest` device (PCI id
+`1234:11e9`), when the guest has one. The device measures the calling process
+against a manifest of its code pages that is signed with the operator key and
+embedded in the binary itself (`.note.attest`), and keeps the payload only if
+they match. The host reads the last accepted payload over QMP (`qom-get
+last-payload` / `last-seq`) and can compare it with what arrived over vsock.
+The guest is never told whether a payload was kept.
+
+The exporter opens the device once at startup; a guest without it runs without
+the channel. The device reports its protocol version in `STATUS[31:16]`; the
+exporter speaks v1 and refuses any other (including a QEMU too old to report
+one), logging one error at startup and running without the channel. Each send
+waits at most 3 s for the device, and it never holds up the vsock send. Source
+code location: `pkg/attest`.
+
+The device vouches that the signed binary produced the bytes, not that they are
+true: `libnvidia-ml` and the `dmesg`/`systemctl` the exporter shells out to are
+not measured, and a guest with root can feed it false inputs.
+
 ## Exported metrics
 
 On every tick (default 10 s; the deployed systemd unit uses 60 s) the exporter
@@ -189,6 +209,34 @@ altogether.
 | `xid_errors` | List of matching `dmesg` lines pending or newly delivered |
 | `dropped_count` | Cumulative lines discarded on buffer overflow; non-zero means XID errors were lost and only the guest's kernel log still has them |
 | `error` | Error message if the `dmesg` invocation failed |
+
+### NVML library (`nvml_library`)
+
+pci-attest vouches for the exporter's own code, not for `libnvidia-ml`, which
+every GPU number is read through: a guest with root can replace that library, or
+preload another that overrides its functions, and have the attested exporter
+report invented numbers. No check inside the guest can rule that out, so the
+exporter judges nothing; each tick it measures what is actually mapped into its
+process and reports it, and the host decides what to trust:
+
+- compare `sha256` with the known builds of the driver version that
+  `gpu_info[].driver_version` names (NVIDIA's packages, or the fleet majority:
+  a thousand VMs on one driver version reporting one digest, and one reporting
+  another, is the anomaly);
+- treat a non-empty `problems` as a reason to distrust the payload's GPU numbers.
+
+| Field | Description |
+| --- | --- |
+| `path` | The mapped `libnvidia-ml` as the kernel names it (symlinks resolved; ` (deleted)` appended when the file was replaced on disk after loading, as a driver upgrade does). Empty when NVML did not load — `exporter_info.init_nvml_error` says why |
+| `sha256`, `size` | Digest and length of the mapped file |
+| `hashed_from` | `mapping`: read through `/proc/self/map_files`, the very inode in use. `path`: the exporter lacked `CAP_SYS_ADMIN` for that and read the file at `path` |
+| `problems` | What a healthy exporter process does not have: `LD_PRELOAD`, `LD_AUDIT` or `LD_LIBRARY_PATH` set; a non-empty `/etc/ld.so.preload`; a tracer attached; an executable mapping that is neither the exporter, the C runtime nor `libnvidia-ml` and its own `libnvidia-*` siblings; a `libnvidia-ml` outside the system library directories, or with a file or parent directory not owned by root or writable by group or others. Empty when none was seen |
+| `error` | Set when the measurement itself failed; the other fields are then partial |
+
+What it cannot see: a modified NVIDIA kernel module (the open GPU kernel modules
+make that easy for root on a guest without Secure Boot and lockdown), or code
+injected into the exporter after a tick's check. Numbers that anything important
+depends on are better taken on the host.
 
 ### Per-GPU metrics (`gpu_info[]`)
 
@@ -411,6 +459,41 @@ make deb VERSION=2026.06.08-2
 ```
 This writes `dist/gpu-metrics-exporter_<version>_amd64.deb` and `dist/gpu-metrics-receiver_<version>_amd64.deb`. If `VERSION` is omitted, it falls back to `git describe --tags --always`.
 
+The pci-attest device accepts payloads only from a signed exporter (an unsigned
+one runs normally, but the device ignores it). Signing patches the manifest into
+the binary in place, after the build:
+```bash
+make docker-build && make sign SIGN_KEY=operator.pem
+make deb VERSION=2026.06.08-2 SIGN_KEY=operator.pem   # signs, then packages
+```
+The manifest also carries a monotonic version, taken from the `ATTEST_VERSION`
+file at the repository root (currently `1`). The device refuses any build whose
+version is below its `min-version`, so this is how old builds are retired:
+
+1. Raise `ATTEST_VERSION` in the same commit as the fix that old builds lack,
+   and tag a release from it. Never lower it.
+2. Once the new release is deployed, raise the hosts' `min-version` to the same
+   number (`-device pci-attest,min-version=N`, or live with `qom-set`).
+
+The version lives in the repository rather than in CI settings so that a
+release signs with the number from its own tagged commit: re-releasing old code
+yields the old number, which the raised `min-version` still refuses. Each
+GitHub Release's notes start with the version it was signed with.
+`make sign ATTEST_VERSION=N` overrides it for local experiments only.
+
+The host needs only the public key:
+```bash
+openssl rsa -in operator.pem -pubout -RSAPublicKey_out -outform DER -out operator-pub.der
+```
+To check a signed binary the way the device will (the note where the device
+finds it, the signature against that public key, the manifest against the
+binary's own code pages, the signed version), without running it:
+```bash
+make verify-signature VERIFY_KEY=operator-pub.der
+```
+Keep the exporter dynamically linked: go-nvml relies on `ld.so` to bind the NVML
+symbols after `dlopen`, so a `-static` build crashes on its first NVML call.
+
 Other targets: `make docker-test` (test suite in the build container), `make lint`
 (golangci-lint, pinned to the same image CI uses), and `make cover` (coverage
 across all packages, including the Linux-only tests).
@@ -427,6 +510,38 @@ The Go toolchain tarball is checksum-verified during the build; `GO_SHA256` in
 `docker/Dockerfile` must be updated whenever `GO_VERSION` is.
 
 CI (`.github/workflows/build.yml`) runs the test suite (`make docker-test`, in a linux/amd64 container), then builds the binaries on every commit / pull request (uploaded as a workflow artifact, not published), and runs the tests + builds + publishes the `.deb` packages to a GitHub Release on a tag push, using the tag name as the version.
+
+Only a release signs the exporter: branch and pull-request builds stay
+unsigned. The release job runs in the GitHub environment `release`, and the
+keys are that environment's secrets — never repository secrets, which any
+workflow pushed on any branch can read. The environment admits tag runs only
+and holds each one for a reviewer's approval (Actions → the run → *Review
+deployments*), so a writer who tags a commit with a doctored workflow cannot
+reach the key unseen. In the release job, the private key exists for the one
+step that signs; the job then packages the signed binary (`make package`) and
+verifies the exporter inside the `.deb` against the public key before anything
+is uploaded. Both secrets are required:
+
+| `release` secret | Contents |
+| --- | --- |
+| `ATTEST_SIGNING_KEY` | the operator's RSA private key (PEM) |
+| `ATTEST_PUBLIC_KEY` | the public key the hosts' QEMU is started with, as base64 of the DER (or PEM) |
+
+Verifying against the hosts' public key, rather than one derived from the
+signing key, is what makes a CI key that does not match the fleet's fail the
+release. One script sets all of it up:
+```bash
+scripts/gen-attest-keys.sh        # -R OWNER/REPO, -o PATH; -f to rotate
+```
+It creates the `release` environment if it is missing (tags only, you as the
+required reviewer) and refuses to upload into an existing one that lets runs
+through unapproved, or while `ATTEST_SIGNING_KEY` is still a repository
+secret. It generates the pair in a private directory in RAM (a RAM disk on
+macOS, `/dev/shm` on Linux), checks it, sets both secrets with `gh`, saves
+`operator-pub.der` for the hosts, and shreds and removes the directory on any
+exit — so the private key ends up only in the secret, which cannot be read
+back. It refuses to replace existing keys without `-f`: that rotates the key,
+and every host's `pubkey` must follow.
 
 ## License
 This project is licensed under the [Apache License 2.0](LICENSE).

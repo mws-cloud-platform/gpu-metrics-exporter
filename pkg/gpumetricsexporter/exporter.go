@@ -66,6 +66,18 @@ type GpuMetricsExporter struct {
 	unsentXIDErrors  []string
 	retiredXIDErrors map[string]time.Time
 	xidErrorsDropped int64
+	// attestDev is the pci-attest device, opened once by Run before the send
+	// loop starts and closed after it exits, so only the send goroutine uses
+	// it in between. nil when the guest has none or it could not be opened.
+	// openAttestFn is the open behind it, swappable in tests.
+	attestDev    attester
+	openAttestFn func() (attester, error)
+	// nvmlLib measures the libnvidia-ml mapped into the process for each
+	// payload's nvml_library; lastNVMLLibraryReport is what was last logged,
+	// so a finding is logged when it changes rather than every tick. Both
+	// belong to the query goroutine.
+	nvmlLib               *nvmlLibraryInspector
+	lastNVMLLibraryReport string
 }
 
 const (
@@ -115,6 +127,8 @@ func NewGpuMetricsExporter(config GpuMetricsExporterConfig) *GpuMetricsExporter 
 	// failure/retry/recovery paths without a GPU.
 	e.initNVMLFn = e.initNVML
 	e.shutdownNVMLFn = e.shutdownNVMLReal
+	e.openAttestFn = openAttestDevice
+	e.nvmlLib = newNVMLLibraryInspector(config)
 	e.onVersionMismatch = func(ret nvml.Return) {
 		e.log.Fatal("NVML driver/library version mismatch detected, exiting for supervisor restart",
 			zap.String("error", nvml.ErrorString(ret)))
@@ -174,11 +188,14 @@ func (e *GpuMetricsExporter) sendMetricsLoop(ctx context.Context) {
 // handles to device files are released between ticks. If a driver upgrade
 // causes a driver/library version mismatch, the exporter exits with a non-zero
 // code so its supervisor (systemd or kubelet) can restart it with a fresh address space.
+// The pci-attest device, by contrast, is opened once here for the whole run.
 func (e *GpuMetricsExporter) Run(ctx context.Context) error {
 	defer e.queryMetricsTicker.Stop()
 
 	e.log.Info("run", zap.Int("ServerPort", e.config.ServerPort), zap.Duration("TickPeriod", e.config.TickPeriod))
 	e.startTime = time.Now().UTC().Unix()
+
+	e.openAttest()
 
 	e.wg.Add(1)
 	go e.sendMetricsLoop(ctx)
@@ -187,6 +204,7 @@ func (e *GpuMetricsExporter) Run(ctx context.Context) error {
 
 	e.log.Info("wait wg")
 	e.wg.Wait()
+	e.closeAttest()
 	e.log.Info("stopped")
 
 	return nil
