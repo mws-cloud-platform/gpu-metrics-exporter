@@ -438,9 +438,22 @@ the binary in place, after the build:
 make docker-build && make sign SIGN_KEY=operator.pem
 make deb VERSION=2026.06.08-2 SIGN_KEY=operator.pem   # signs, then packages
 ```
-`ATTEST_VERSION` (default `1`) is the monotonic release number signed into the
-manifest; the host refuses anything below its `min-version`, so raising it
-retires older builds. The host needs only the public key:
+The manifest also carries a monotonic version, taken from the `ATTEST_VERSION`
+file at the repository root (currently `1`). The device refuses any build whose
+version is below its `min-version`, so this is how old builds are retired:
+
+1. Raise `ATTEST_VERSION` in the same commit as the fix that old builds lack,
+   and tag a release from it. Never lower it.
+2. Once the new release is deployed, raise the hosts' `min-version` to the same
+   number (`-device pci-attest,min-version=N`, or live with `qom-set`).
+
+The version lives in the repository rather than in CI settings so that a
+release signs with the number from its own tagged commit: re-releasing old code
+yields the old number, which the raised `min-version` still refuses. Each
+GitHub Release's notes start with the version it was signed with.
+`make sign ATTEST_VERSION=N` overrides it for local experiments only.
+
+The host needs only the public key:
 ```bash
 openssl rsa -in operator.pem -pubout -RSAPublicKey_out -outform DER -out operator-pub.der
 ```
@@ -470,16 +483,37 @@ The Go toolchain tarball is checksum-verified during the build; `GO_SHA256` in
 
 CI (`.github/workflows/build.yml`) runs the test suite (`make docker-test`, in a linux/amd64 container), then builds the binaries on every commit / pull request (uploaded as a workflow artifact, not published), and runs the tests + builds + publishes the `.deb` packages to a GitHub Release on a tag push, using the tag name as the version.
 
-CI signs the exporter with the key in the `ATTEST_SIGNING_KEY` repository secret
-(the PEM itself: `gh secret set ATTEST_SIGNING_KEY < operator.pem`), then
-verifies the signature against the `ATTEST_PUBLIC_KEY` secret — the public key
-the hosts' QEMU is started with, not one derived from the signing key, so a CI
-key that does not match the fleet's fails the build. A secret holds text, so
-store the DER as base64 (`base64 < operator-pub.der | gh secret set
-ATTEST_PUBLIC_KEY`) or a PEM. A tag build refuses to release without either
-secret and verifies the binary inside the `.deb` before uploading anything;
-branch builds sign and verify when the secrets are set, with a warning
-otherwise, and pull requests are never signed.
+Only a release signs the exporter: branch and pull-request builds stay
+unsigned. The release job runs in the GitHub environment `release`, and the
+keys are that environment's secrets — never repository secrets, which any
+workflow pushed on any branch can read. The environment admits tag runs only
+and holds each one for a reviewer's approval (Actions → the run → *Review
+deployments*), so a writer who tags a commit with a doctored workflow cannot
+reach the key unseen. In the release job, the private key exists for the one
+step that signs; the job then packages the signed binary (`make package`) and
+verifies the exporter inside the `.deb` against the public key before anything
+is uploaded. Both secrets are required:
+
+| `release` secret | Contents |
+| --- | --- |
+| `ATTEST_SIGNING_KEY` | the operator's RSA private key (PEM) |
+| `ATTEST_PUBLIC_KEY` | the public key the hosts' QEMU is started with, as base64 of the DER (or PEM) |
+
+Verifying against the hosts' public key, rather than one derived from the
+signing key, is what makes a CI key that does not match the fleet's fail the
+release. One script sets all of it up:
+```bash
+scripts/gen-attest-keys.sh        # -R OWNER/REPO, -o PATH; -f to rotate
+```
+It creates the `release` environment if it is missing (tags only, you as the
+required reviewer) and refuses to upload into an existing one that lets runs
+through unapproved, or while `ATTEST_SIGNING_KEY` is still a repository
+secret. It generates the pair in a private directory in RAM (a RAM disk on
+macOS, `/dev/shm` on Linux), checks it, sets both secrets with `gh`, saves
+`operator-pub.der` for the hosts, and shreds and removes the directory on any
+exit — so the private key ends up only in the secret, which cannot be read
+back. It refuses to replace existing keys without `-f`: that rotates the key,
+and every host's `pubkey` must follow.
 
 ## License
 This project is licensed under the [Apache License 2.0](LICENSE).
