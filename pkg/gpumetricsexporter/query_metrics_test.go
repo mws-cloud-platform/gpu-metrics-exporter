@@ -11,14 +11,12 @@ import (
 )
 
 // TestInitNVMLForTick covers the per-tick NVML lifecycle: init is attempted
-// on every tick (a failing init — e.g. "Driver/library version mismatch"
-// after a guest-side driver upgrade without a reboot — must not pin the
-// exporter to empty metrics until the VM is restarted), and a successful
-// tick is paired with a shutdown that releases the dlopen handle so a
-// library update on disk is picked up by the next tick. Both are guarded on
-// nvmlInitialized: shutdown after a failed init must be a no-op (the real
-// nvml.Shutdown would be a cgo abort no recover() can contain), and a second
-// init must not bump NVML's refcount past what the paired shutdown releases.
+// on every tick (a transient init failure must not pin the exporter to empty
+// metrics permanently), and a successful tick is paired with a shutdown that
+// releases open GPU device handles. Both are guarded on nvmlInitialized:
+// shutdown after a failed init must be a no-op (the real nvml.Shutdown would
+// be a cgo abort no recover() can contain), and a second init must not bump
+// NVML's refcount past what the paired shutdown releases.
 func TestInitNVMLForTick(t *testing.T) {
 	newExporter := func() *GpuMetricsExporter {
 		return NewGpuMetricsExporter(GpuMetricsExporterConfig{
@@ -30,7 +28,7 @@ func TestInitNVMLForTick(t *testing.T) {
 
 	t.Run("init failure retried on every tick, recovers on its own", func(t *testing.T) {
 		e := newExporter()
-		initErr := errors.New("Driver/library version mismatch")
+		initErr := errors.New("transient init failure")
 		inits, shutdowns := 0, 0
 		e.initNVMLFn = func() error {
 			inits++

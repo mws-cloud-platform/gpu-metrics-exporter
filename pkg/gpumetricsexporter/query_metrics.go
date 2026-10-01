@@ -37,7 +37,11 @@ const (
 )
 
 func (e *GpuMetricsExporter) readInstanceID() (string, error) {
-	data, err := os.ReadFile(cloudInitInstanceIDFilePath)
+	filePath := e.config.InstanceIDPath
+	if filePath == "" {
+		filePath = cloudInitInstanceIDFilePath
+	}
+	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return "", err
 	}
@@ -45,29 +49,107 @@ func (e *GpuMetricsExporter) readInstanceID() (string, error) {
 	return instanceID, nil
 }
 
-// initNVML initializes the NVML library
+// getNVML returns the active NVML interface
+func (e *GpuMetricsExporter) getNVML() nvml.Interface {
+	return e.nvmlClient
+}
+
+// initNVML initializes the NVML library.
+//
+// If an explicit library path was configured (NvmlLibPath), it uses that path.
+// Otherwise, it first attempts to load NVML using the default system dynamic
+// linker (dlopen("libnvidia-ml.so.1")), which preserves standard host and VM behavior.
+// If the default loader fails to find the library (e.g. running inside a container
+// where the driver is located in a GPU Operator container or host mount), it falls back
+// to probing well-known candidate paths via FindNVMLLibraryPath.
+//
+// If initialization returns ERROR_LIB_RM_VERSION_MISMATCH (e.g. after a driver upgrade,
+// where glibc marks the previously-loaded library as NODELETE), the exporter exits
+// with a non-zero code so the supervisor (systemd or kubelet) can restart it with
+// a fresh address space.
 func (e *GpuMetricsExporter) initNVML() error {
-	ret := nvml.Init()
-	if ret != nvml.SUCCESS {
+	if e.config.NvmlLibPath != "" {
+		resolvedLibPath := FindNVMLLibraryPath(e.config.NvmlLibPath, e.config.HostRoot)
+		e.logInitPath(resolvedLibPath)
+		client := nvml.New(nvml.WithLibraryPath(resolvedLibPath))
+		ret := client.Init()
+		if ret == nvml.ERROR_LIB_RM_VERSION_MISMATCH {
+			e.onVersionMismatch(ret)
+		}
+		if ret != nvml.SUCCESS {
+			return fmt.Errorf("nvml init error %s", nvml.ErrorString(ret))
+		}
+		e.nvmlClient = client
+		return nil
+	}
+
+	// 1. Try standard dynamic linker first (default behavior, dlopen("libnvidia-ml.so.1"))
+	defaultClient := nvml.New()
+	ret := defaultClient.Init()
+	if ret == nvml.SUCCESS {
+		e.logInitPath("")
+		e.nvmlClient = defaultClient
+		return nil
+	}
+	if ret == nvml.ERROR_LIB_RM_VERSION_MISMATCH {
+		e.onVersionMismatch(ret)
 		return fmt.Errorf("nvml init error %s", nvml.ErrorString(ret))
 	}
-	return nil
+
+	// 2. If default system dlopen failed (e.g. running in a container where libnvidia-ml
+	// is mounted under /run/nvidia/driver or /host), search fallback candidate paths.
+	resolvedLibPath := FindNVMLLibraryPath("", e.config.HostRoot)
+	if resolvedLibPath != "" {
+		fallbackClient := nvml.New(nvml.WithLibraryPath(resolvedLibPath))
+		fallbackRet := fallbackClient.Init()
+		if fallbackRet == nvml.ERROR_LIB_RM_VERSION_MISMATCH {
+			e.onVersionMismatch(fallbackRet)
+			return fmt.Errorf("nvml fallback init error (%s): %s", resolvedLibPath, nvml.ErrorString(fallbackRet))
+		}
+		if fallbackRet == nvml.SUCCESS {
+			e.logInitPath(resolvedLibPath)
+			e.nvmlClient = fallbackClient
+			return nil
+		}
+		return fmt.Errorf("nvml fallback init error (%s): %s (default init error: %s)",
+			resolvedLibPath, nvml.ErrorString(fallbackRet), nvml.ErrorString(ret))
+	}
+
+	return fmt.Errorf("nvml init error %s", nvml.ErrorString(ret))
+}
+
+func (e *GpuMetricsExporter) logInitPath(path string) {
+	if path != e.lastNvmlLibPath || !e.nvmlPathLogged {
+		e.nvmlPathLogged = true
+		e.lastNvmlLibPath = path
+		if path != "" {
+			e.log.Info("initializing NVML with library path", zap.String("path", path))
+		} else {
+			e.log.Info("initializing NVML with default system library")
+		}
+	} else {
+		if path != "" {
+			e.log.Debug("initializing NVML with library path", zap.String("path", path))
+		} else {
+			e.log.Debug("initializing NVML with default system library")
+		}
+	}
 }
 
 // initNVMLForTick initializes NVML for one collection tick. NVML is
 // initialized and shut down around every tick rather than once for the
 // process lifetime, for two reasons:
 //
-//   - dlopen pins the first-loaded library: a driver upgrade inside the
-//     guest replaces libnvidia-ml.so.1 on disk, but a process holding an
-//     open handle keeps reading the pre-upgrade library (or failing with
-//     "Driver/library version mismatch") until it restarts. Shutdown
-//     dlclose()s the handle, so the next tick picks up the new library.
-//   - a failed init is retried on the next tick instead of leaving the
-//     exporter shipping empty metrics until the VM is restarted.
+//   - Open handles to /dev/nvidia* and driver resources are released between ticks,
+//     preventing the exporter from blocking driver module unloads or MIG repartitioning.
+//   - A failed init is retried on the next tick instead of leaving the
+//     exporter shipping empty metrics until the process is restarted.
 //
-// nvmlInit/nvmlShutdown are refcounted and the dlopen/dlclose pair costs
-// microseconds, which is nothing at tick granularity.
+// Note: glibc marks libnvidia-ml.so as NODELETE due to symbol references from cgo,
+// so dlclose() does not unmap the library from the process address space. If a driver
+// upgrade replaces the kernel driver and causes ERROR_LIB_RM_VERSION_MISMATCH, the
+// exporter terminates with a non-zero exit code so its supervisor (systemd or kubelet)
+// can restart it with a fresh address space.
 //
 // Idempotent: a call with NVML already initialized is a no-op. A second Init
 // would bump NVML's refcount, and the single paired Shutdown would then
@@ -123,16 +205,19 @@ func (e *GpuMetricsExporter) shutdownNVML() {
 // per-tick init/shutdown cycle is active: it would be a data race on that
 // global, and the race detector cannot see it across the cgo boundary.
 func (e *GpuMetricsExporter) shutdownNVMLReal() {
-	ret := nvml.Shutdown()
-	if ret != nvml.SUCCESS {
-		err := fmt.Errorf("nvml shutdown error %s", nvml.ErrorString(ret))
-		e.log.Error("nvml.Shutdown", zap.Error(err))
+	if e.nvmlClient != nil {
+		ret := e.nvmlClient.Shutdown()
+		if ret != nvml.SUCCESS {
+			err := fmt.Errorf("nvml shutdown error %s", nvml.ErrorString(ret))
+			e.log.Error("nvml.Shutdown", zap.Error(err))
+		}
+		e.nvmlClient = nil
 	}
 }
 
 // getDeviceCount returns the number of NVIDIA GPUs
 func (e *GpuMetricsExporter) getDeviceCount() (int, error) {
-	count, ret := nvml.DeviceGetCount()
+	count, ret := e.getNVML().DeviceGetCount()
 	if ret != nvml.SUCCESS {
 		err := fmt.Errorf("unable to get device count: %v", nvml.ErrorString(ret))
 		e.log.Error("nvml.DeviceGetCount", zap.Error(err))
@@ -143,7 +228,7 @@ func (e *GpuMetricsExporter) getDeviceCount() (int, error) {
 
 // getDeviceHandle returns the device handle for a given GPU index
 func (e *GpuMetricsExporter) getDeviceHandle(index int) (nvml.Device, error) {
-	device, ret := nvml.DeviceGetHandleByIndex(index)
+	device, ret := e.getNVML().DeviceGetHandleByIndex(index)
 	if ret != nvml.SUCCESS {
 		return nil, fmt.Errorf("unable to get device at index %d: %v", index, nvml.ErrorString(ret))
 	}
@@ -157,11 +242,10 @@ func (e *GpuMetricsExporter) getDeviceHandle(index int) (nvml.Device, error) {
 // whole tick.
 func (e *GpuMetricsExporter) queryMetrics() (*gpumetrics.GpuMetrics, error) {
 	// Initialize NVML for this tick and shut it down after collection (see
-	// initNVMLForTick/shutdownNVML): a fresh dlopen every tick picks up a
-	// library update on disk and retries a failed init instead of pinning
-	// the exporter to the driver state at process start. Both are guarded
-	// on nvmlInitialized, so the unconditional shutdown is a no-op on a
-	// tick whose init failed.
+	// initNVMLForTick/shutdownNVML): retries a failed init on each tick and
+	// releases driver device handles between ticks. Both are guarded on
+	// nvmlInitialized, so the unconditional shutdown is a no-op on a tick
+	// whose init failed.
 	e.initNVMLForTick()
 	defer e.shutdownNVML()
 
@@ -428,7 +512,7 @@ func (e *GpuMetricsExporter) collectPCIInfo(device nvml.Device, info *gpumetrics
 
 // collectDriverInfo collects GPU driver information
 func (e *GpuMetricsExporter) collectDriverInfo(info *gpumetrics.GPUInfo) {
-	if driverVersion, ret := nvml.SystemGetDriverVersion(); ret == nvml.SUCCESS {
+	if driverVersion, ret := e.getNVML().SystemGetDriverVersion(); ret == nvml.SUCCESS {
 		info.DriverVersion = driverVersion
 	}
 }
@@ -881,20 +965,27 @@ func parseEventReasons(events uint64) string {
 }
 
 func (e *GpuMetricsExporter) runCommand(name string, args ...string) (int, string) {
-	e.log.Debug("run", zap.String("name", name), zap.Strings("args", args))
-	cmd := exec.Command(name, args...)
+	execName := name
+	execArgs := args
+	if name == "systemctl" && e.config.HostRoot != "" && e.config.HostRoot != "/" {
+		// If running in a container with host root mounted, run systemctl via host chroot
+		execName = "chroot"
+		execArgs = append([]string{e.config.HostRoot, "systemctl"}, args...)
+	}
+	e.log.Debug("run", zap.String("name", execName), zap.Strings("args", execArgs))
+	cmd := exec.Command(execName, execArgs...)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		if exitError, ok := err.(*exec.ExitError); ok {
 			exitCode := exitError.Sys().(syscall.WaitStatus).ExitStatus()
-			e.log.Warn("run", zap.String("name", name), zap.Strings("args", args), zap.Error(err),
+			e.log.Warn("run", zap.String("name", execName), zap.Strings("args", execArgs), zap.Error(err),
 				zap.Int("exitCode", exitCode), zap.String("output", string(output)))
 			return exitCode, string(output)
 		}
-		e.log.Error("run", zap.String("name", name), zap.Strings("args", args), zap.Error(err), zap.String("output", string(output)))
+		e.log.Error("run", zap.String("name", execName), zap.Strings("args", execArgs), zap.Error(err), zap.String("output", string(output)))
 		return -1, string(output)
 	}
-	e.log.Debug("run", zap.String("name", name), zap.Strings("args", args), zap.String("output", string(output)))
+	e.log.Debug("run", zap.String("name", execName), zap.Strings("args", execArgs), zap.String("output", string(output)))
 	return 0, string(output)
 }
 

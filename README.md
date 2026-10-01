@@ -352,6 +352,53 @@ Match on `index` rather than on position in the array.
 | `links[].errors_delta` | Map of error-counter type → per-tick change |
 | `links[].error` | Error message if a link query failed for some reason other than the counter being unavailable |
 
+## Kubernetes DaemonSet & NVIDIA GPU Operator
+
+`gpu-metrics-exporter` can run as a Kubernetes `DaemonSet` on GPU worker nodes (VMs with AF_VSOCK support).
+
+### Features
+- **NVIDIA GPU Operator compatibility**: automatically discovers `libnvidia-ml.so.1` across driver container paths (`/run/nvidia/driver/usr/lib/x86_64-linux-gnu`, `/run/nvidia/driver/usr/lib64`), container toolkit paths (`/usr/local/nvidia/lib64`), and host paths under `/host`. Can be overridden via `GPU_METRICS_EXPORTER_NVML_LIB_PATH`.
+- **AF_VSOCK transport**: connects to `VMADDR_CID_HOST` (CID 2) via kernel `AF_VSOCK` sockets.
+- **Node & hardware diagnostics**: reads `/dev/kmsg` (kernel ring buffer for XID/SXID errors) and inspects `nvidia-fabricmanager` via host `chroot`.
+- **Host instance identification**: mounts `/var/lib/cloud/data/instance-id` directly from the host.
+
+### Configuration
+
+The exporter supports configuration via both environment variables (with optional `GPU_METRICS_EXPORTER_` prefix) and CLI flags:
+
+| Environment Variable | CLI Flag | Default | Description |
+| --- | --- | --- | --- |
+| `GPU_METRICS_EXPORTER_SERVER_PORT` / `SERVER_PORT` | `-serverPort` | `1234` (systemd / k8s: `9999`) | Destination vsock port on host CID 2 |
+| `GPU_METRICS_EXPORTER_TICK_PERIOD` / `TICK_PERIOD` | `-tickPeriod` | `10` (systemd / k8s: `60`) | Collection interval in seconds |
+| `GPU_METRICS_EXPORTER_LOG_LEVEL` / `LOG_LEVEL` | `-logLevel` | `info` | Logging level (`debug`, `info`, `warn`, `error`) |
+| `GPU_METRICS_EXPORTER_NVML_LIB_PATH` / `NVML_LIB_PATH` | `-nvmlLibPath` | `""` (auto) | Explicit path to `libnvidia-ml.so.1` |
+| `GPU_METRICS_EXPORTER_INSTANCE_ID_PATH` / `INSTANCE_ID_PATH` | `-instanceIdPath` | `/var/lib/cloud/data/instance-id` | Path to cloud-init instance ID |
+| `GPU_METRICS_EXPORTER_HOST_ROOT` / `HOST_ROOT` | `-hostRoot` | `/` (k8s: `/host`) | Host root filesystem mount point for chroot |
+
+### Mutual exclusion with systemd (.deb) package
+
+> [!WARNING]
+> **Do not run both the systemd `.deb` service and the Kubernetes DaemonSet on the same node / VM.**
+> All processes and containers running inside a single VM share the same guest vsock CID. If both the host systemd service (`gpu-metrics-exporter.service`) and the DaemonSet pod run concurrently, two independent metric streams will connect from the same CID to the host receiver. This causes interleaved sequence numbers (`seqno`), duplicated XID error reporting, and corrupted counter deltas (`*_delta`).
+>
+> If your GPU worker node image already includes the `.deb` package, disable the host service before deploying the DaemonSet:
+> ```bash
+> sudo systemctl disable --now gpu-metrics-exporter
+> ```
+
+### Deployment
+
+1. Build the container image:
+```bash
+make docker-image DOCKER_IMAGE_NAME=<registry>/gpu-metrics-exporter:<tag>
+docker push <registry>/gpu-metrics-exporter:<tag>
+```
+
+2. Apply the DaemonSet manifest:
+```bash
+kubectl apply -f k8s/daemonset.yaml
+```
+
 ## How to build
 ```bash
 make docker-build
@@ -372,12 +419,12 @@ The build image installs packages from Ubuntu's own archives. Where those are
 slow or blocked, substitute a mirror:
 
 ```bash
-docker build --platform linux/amd64 -f docker/local-build.Dockerfile \
+docker build --platform linux/amd64 -f docker/Dockerfile \
   --build-arg APT_MIRROR=http://mirror.yandex.ru/ubuntu .
 ```
 
 The Go toolchain tarball is checksum-verified during the build; `GO_SHA256` in
-`docker/local-build.Dockerfile` must be updated whenever `GO_VERSION` is.
+`docker/Dockerfile` must be updated whenever `GO_VERSION` is.
 
 CI (`.github/workflows/build.yml`) runs the test suite (`make docker-test`, in a linux/amd64 container), then builds the binaries on every commit / pull request (uploaded as a workflow artifact, not published), and runs the tests + builds + publishes the `.deb` packages to a GitHub Release on a tag push, using the tag name as the version.
 

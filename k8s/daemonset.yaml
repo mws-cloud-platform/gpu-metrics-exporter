@@ -1,0 +1,125 @@
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gpu-metrics-exporter
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: gpu-metrics-exporter
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gpu-metrics-exporter-config
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: gpu-metrics-exporter
+data:
+  # Port on the hypervisor host listening for vsock connections
+  GPU_METRICS_EXPORTER_SERVER_PORT: "9999"
+  SERVER_PORT: "9999"
+  # Metric collection period in seconds
+  GPU_METRICS_EXPORTER_TICK_PERIOD: "60"
+  TICK_PERIOD: "60"
+  # Log level (debug, info, warn, error)
+  GPU_METRICS_EXPORTER_LOG_LEVEL: "info"
+  LOG_LEVEL: "info"
+  # Explicit path to libnvidia-ml.so.1 (leave empty for auto-detection in GPU Operator paths)
+  GPU_METRICS_EXPORTER_NVML_LIB_PATH: ""
+  NVML_LIB_PATH: ""
+  # Path to cloud-init instance-id file inside container
+  GPU_METRICS_EXPORTER_INSTANCE_ID_PATH: "/var/lib/cloud/data/instance-id"
+  INSTANCE_ID_PATH: "/var/lib/cloud/data/instance-id"
+  # Path where the host root filesystem is mounted inside container
+  GPU_METRICS_EXPORTER_HOST_ROOT: "/host"
+  HOST_ROOT: "/host"
+
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: gpu-metrics-exporter
+  namespace: kube-system
+  labels:
+    app.kubernetes.io/name: gpu-metrics-exporter
+    app.kubernetes.io/component: exporter
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: gpu-metrics-exporter
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: gpu-metrics-exporter
+        app.kubernetes.io/component: exporter
+    spec:
+      serviceAccountName: gpu-metrics-exporter
+      # runtimeClassName: nvidia enables NVIDIA Container Toolkit runtime hooks
+      # to inject driver libraries (libnvidia-ml.so) and GPU device nodes
+      runtimeClassName: nvidia
+      tolerations:
+        - key: mws.ru/gpu.present
+          operator: Exists
+          effect: NoSchedule
+        - key: CriticalAddonsOnly
+          operator: Exists
+      nodeSelector:
+        mws.ru/gpu.present: "true"
+      containers:
+        - name: exporter
+          image: registry.mwsapis.ru/mws-mk8s-images/customer/gpu-metrics-exporter:v1.0.0
+          imagePullPolicy: IfNotPresent
+          # privileged is required for host dmesg (/dev/kmsg) and host chroot execution
+          securityContext:
+            privileged: true
+          env:
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: "all"
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: "all"
+          envFrom:
+            - configMapRef:
+                name: gpu-metrics-exporter-config
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 250m
+              memory: 256Mi
+          volumeMounts:
+            # Kernel messages for XID error tracking
+            - name: dev-kmsg
+              mountPath: /dev/kmsg
+              readOnly: true
+            # NVIDIA GPU Operator driver libraries with mountPropagation
+            - name: run-nvidia
+              mountPath: /run/nvidia
+              mountPropagation: HostToContainer
+              readOnly: true
+            # Cloud-init instance ID
+            - name: cloud-init
+              mountPath: /var/lib/cloud/data
+              readOnly: true
+            # Host root mount for chroot execution of systemctl (nvidia-fabricmanager status)
+            - name: host-root
+              mountPath: /host
+              readOnly: true
+      volumes:
+        - name: dev-kmsg
+          hostPath:
+            path: /dev/kmsg
+            type: CharDevice
+        - name: run-nvidia
+          hostPath:
+            path: /run/nvidia
+            type: DirectoryOrCreate
+        - name: cloud-init
+          hostPath:
+            path: /var/lib/cloud/data
+            type: DirectoryOrCreate
+        - name: host-root
+          hostPath:
+            path: /
+            type: Directory
