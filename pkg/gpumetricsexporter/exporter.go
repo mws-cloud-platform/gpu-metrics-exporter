@@ -50,22 +50,17 @@ type GpuMetricsExporter struct {
 	sendMetricsLastError  string
 	lastMetricsMu         sync.RWMutex
 	lastMetrics           *gpumetrics.GpuMetrics
-	// XID/SXID error-line tracking. unsentXIDErrors holds lines that have been
-	// observed in dmesg but whose carrying payload has not yet been confirmed
-	// delivered: they ride along on every subsequent payload until a send
-	// succeeds, so a transient send failure (or a send stall lasting longer
-	// than the dmesg look-back window) cannot silently drop an XID.
-	// retiredXIDErrors maps a line that has left the pending buffer — whether
-	// delivered or dropped on overflow — to when it left, so the overlapping
-	// dmesg window cannot re-admit it; records are pruned once they age out of
-	// that window. Dropped lines belong in here too: a line that is neither
-	// pending nor retired looks fresh on the next tick and gets re-queued
-	// behind newer lines, which then get evicted in its place.
-	// xidErrorsDropped counts lines evicted on overflow and is reported on the
-	// wire as XIDErrors.DroppedCount. All three are guarded by lastMetricsMu.
+	// XID/SXID error-line tracking. unsentXIDErrors holds lines read from the
+	// kernel log whose carrying payload has not yet been confirmed delivered:
+	// they ride along on every subsequent payload until a send succeeds, so a
+	// transient send failure cannot silently drop an XID. xidErrorsDropped
+	// counts lines evicted on overflow and is reported on the wire as
+	// XIDErrors.DroppedCount. Both are guarded by lastMetricsMu.
 	unsentXIDErrors  []string
-	retiredXIDErrors map[string]time.Time
 	xidErrorsDropped int64
+	// kmsg reads the kernel log the XID lines come from. It belongs to the
+	// query goroutine; Run closes it once the query loop has exited.
+	kmsg *kmsgReader
 	// attestDev is the pci-attest device, opened once by Run before the send
 	// loop starts and closed after it exits, so only the send goroutine uses
 	// it in between. nil when the guest has none or it could not be opened.
@@ -92,14 +87,11 @@ const (
 	// the current fault) and the loss is counted, never silent.
 	maxUnsentXIDErrors = 128
 
-	// maxRetiredXIDErrors backstops the retired-line set for the case where a
-	// single dmesg window carries more distinct lines than age-based pruning
-	// retires.
-	maxRetiredXIDErrors = 1024
-
-	// xidDmesgWindowSlack is added to TickPeriod to form the dmesg look-back
-	// window, so consecutive ticks overlap and no line falls between them.
-	xidDmesgWindowSlack = 10 * time.Second
+	// xidStartupLookbackSlack is added to TickPeriod to bound how far back the
+	// first read of the kernel log reaches: the window the exporter used to
+	// give dmesg on every tick, so a restart neither re-ships the whole ring
+	// buffer nor skips what was logged just before it.
+	xidStartupLookbackSlack = 10 * time.Second
 )
 
 // NewGpuMetricsExporter constructs an exporter from config. A non-positive
@@ -129,6 +121,7 @@ func NewGpuMetricsExporter(config GpuMetricsExporterConfig) *GpuMetricsExporter 
 	e.shutdownNVMLFn = e.shutdownNVMLReal
 	e.openAttestFn = openAttestDevice
 	e.nvmlLib = newNVMLLibraryInspector(config)
+	e.kmsg = newKmsgReader(log)
 	e.onVersionMismatch = func(ret nvml.Return) {
 		e.log.Fatal("NVML driver/library version mismatch detected, exiting for supervisor restart",
 			zap.String("error", nvml.ErrorString(ret)))
@@ -201,6 +194,7 @@ func (e *GpuMetricsExporter) Run(ctx context.Context) error {
 	go e.sendMetricsLoop(ctx)
 
 	e.queryMetricsLoop(ctx)
+	e.kmsg.closeDevice()
 
 	e.log.Info("wait wg")
 	e.wg.Wait()

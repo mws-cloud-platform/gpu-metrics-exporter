@@ -296,15 +296,17 @@ func (e *GpuMetricsExporter) queryMetrics() (*gpumetrics.GpuMetrics, error) {
 		metrics.NvFabricManagerStatus = status
 	}
 
+	// The pending lines ship even on a tick whose kernel log read failed: they
+	// were collected before, and a broken read must not hold them back.
 	xidErrors, err := e.getXIDErrors()
+	metrics.XIDErrors.XIDErrors = xidErrors
 	if err != nil {
 		metrics.XIDErrors.Error = fmt.Sprintf("e.getXIDErrors error: %v", err)
-	} else {
-		metrics.XIDErrors.XIDErrors = xidErrors
 	}
-	// Cumulative, and reported even on a tick where dmesg itself failed: a
+	// Cumulative, and reported even on a tick where the read failed: a
 	// non-zero count means XID lines were lost and must not go unnoticed.
 	metrics.XIDErrors.DroppedCount = e.xidErrorsDroppedCount()
+	metrics.XIDErrors.KernelLogLostCount = e.kmsg.lostRecords()
 
 	// Publish this snapshot as the delta baseline for the next tick. Computing
 	// deltas against the last *collected* snapshot (not the last *sent* one)
@@ -1008,59 +1010,34 @@ func (e *GpuMetricsExporter) checkFabricManager() (gpumetrics.NvFabricManagerSta
 	return status, nil
 }
 
+// getXIDErrors queues the XID/SXID lines logged since the last tick and returns
+// the whole pending set, which sendMetrics drains once a payload carrying it is
+// delivered. The pending set comes back even when reading the kernel log
+// failed, alongside the error.
 func (e *GpuMetricsExporter) getXIDErrors() ([]string, error) {
-	window := e.config.TickPeriod + xidDmesgWindowSlack
-	secAgo := int(window.Seconds())
-	exitCode, output := e.runCommand("dmesg", "--since", fmt.Sprintf("%d sec ago", secAgo), "-l", "err")
-	if exitCode != 0 {
-		err := fmt.Errorf("dmesg failed with code: %d", exitCode)
-		return nil, err
-	}
-
-	// Pull candidate XID/SXID lines out of dmesg without holding the lock: the
-	// dmesg shell-out can take a while and must not block the send goroutine,
-	// which needs lastMetricsMu to record send outcomes.
-	var candidates []string
-	for line := range strings.SplitSeq(output, "\n") {
-		lowerLine := strings.ToLower(line)
-		if strings.Contains(lowerLine, "xid") || strings.Contains(lowerLine, "sxid") {
-			candidates = append(candidates, line)
+	// Read without holding the lock: the first drain walks the whole ring
+	// buffer, and the send goroutine needs lastMetricsMu to record send
+	// outcomes. The reader delivers each record once, so a line needs no
+	// check against what was queued or sent before.
+	var lines []string
+	err := e.kmsg.drain(e.config.TickPeriod+xidStartupLookbackSlack, func(r kmsgRecord) {
+		if isXIDRecord(r) {
+			lines = append(lines, r.dmesgLine())
 		}
-	}
+	})
 
 	e.lastMetricsMu.Lock()
 	defer e.lastMetricsMu.Unlock()
 
-	// Retire records that can no longer collide with the dmesg window. This is
-	// what keeps retiredXIDErrors bounded over the process lifetime: dmesg
-	// lines carry timestamps, so no two are ever equal and an unpruned set
-	// would grow forever.
-	e.pruneRetiredXIDErrors(time.Now(), 2*window)
-
-	// Buffer any fresh line: skip lines already retired (delivered, or dropped
-	// on overflow) and lines already queued. Buffering happens regardless of
-	// the dmesg window, so a line observed once is re-shipped on every
-	// following payload until its carrying payload is confirmed sent —
-	// surviving both transient send failures and dmesg-window expiry.
-	for _, line := range candidates {
-		if _, retired := e.retiredXIDErrors[line]; retired {
-			continue
-		}
-		if slices.Contains(e.unsentXIDErrors, line) {
-			continue
-		}
-		e.unsentXIDErrors = append(e.unsentXIDErrors, line)
-	}
-
+	// A line is re-shipped on every following payload until its carrying
+	// payload is confirmed sent, surviving transient send failures.
+	e.unsentXIDErrors = append(e.unsentXIDErrors, lines...)
 	e.trimUnsentXIDErrors()
 
 	if len(e.unsentXIDErrors) == 0 {
-		return nil, nil
+		return nil, err
 	}
-	// Return the full pending set; sendMetrics drains it on success.
-	result := make([]string, len(e.unsentXIDErrors))
-	copy(result, e.unsentXIDErrors)
-	return result, nil
+	return slices.Clone(e.unsentXIDErrors), err
 }
 
 // trimUnsentXIDErrors bounds the pending re-ship buffer to maxUnsentXIDErrors.
@@ -1082,60 +1059,11 @@ func (e *GpuMetricsExporter) trimUnsentXIDErrors() {
 	e.unsentXIDErrors = append([]string(nil), e.unsentXIDErrors[overflow:]...)
 	e.xidErrorsDropped += int64(overflow)
 
-	// Retire the evicted lines so the next tick cannot re-admit them. Without
-	// this they are neither retired nor pending, so a line still inside the
-	// overlapping dmesg window looks fresh, gets appended to the *tail*, and
-	// the following trim evicts from the head — which by then holds lines
-	// *newer* than the ones just re-admitted. That inverts the oldest-first
-	// rule above and re-counts the same physical line into xidErrorsDropped on
-	// every tick it thrashes, making DroppedCount overstate the real loss.
-	if e.retiredXIDErrors == nil {
-		e.retiredXIDErrors = make(map[string]time.Time, overflow)
-	}
-	now := time.Now()
-	for _, line := range dropped {
-		e.retiredXIDErrors[line] = now
-	}
 	e.log.Warn("XID buffer full, dropped oldest lines",
 		zap.Int("dropped", overflow),
 		zap.Int("max", maxUnsentXIDErrors),
 		zap.Int64("droppedTotal", e.xidErrorsDropped),
 		zap.Strings("droppedLines", dropped))
-}
-
-// pruneRetiredXIDErrors drops retired-line records older than retention, then
-// trims what remains to the maxRetiredXIDErrors most recent as a backstop against
-// a dmesg window carrying more distinct lines than age alone retires.
-//
-// Evicting a record whose line is still inside the dmesg look-back window lets
-// that line be re-admitted to the pending buffer. Callers pass a retention of
-// twice the window, so age-based pruning never does this; only the size
-// backstop can, and it trips solely during an XID storm where a re-admission is
-// the lesser problem.
-//
-// Callers must hold lastMetricsMu.
-func (e *GpuMetricsExporter) pruneRetiredXIDErrors(now time.Time, retention time.Duration) {
-	for line, retiredAt := range e.retiredXIDErrors {
-		if now.Sub(retiredAt) > retention {
-			delete(e.retiredXIDErrors, line)
-		}
-	}
-
-	if len(e.retiredXIDErrors) <= maxRetiredXIDErrors {
-		return
-	}
-
-	lines := make([]string, 0, len(e.retiredXIDErrors))
-	for line := range e.retiredXIDErrors {
-		lines = append(lines, line)
-	}
-	// Newest first, so everything past the cap is the oldest.
-	slices.SortFunc(lines, func(a, b string) int {
-		return e.retiredXIDErrors[b].Compare(e.retiredXIDErrors[a])
-	})
-	for _, line := range lines[maxRetiredXIDErrors:] {
-		delete(e.retiredXIDErrors, line)
-	}
 }
 
 // xidErrorsDroppedCount returns the cumulative number of XID/SXID lines
