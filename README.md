@@ -235,7 +235,7 @@ process and reports it, and the host decides what to trust:
 | `path` | The mapped `libnvidia-ml` as the kernel names it (symlinks resolved; ` (deleted)` appended when the file was replaced on disk after loading, as a driver upgrade does). Empty when NVML did not load — `exporter_info.init_nvml_error` says why |
 | `sha256`, `size` | Digest and length of the mapped file |
 | `hashed_from` | `mapping`: read through `/proc/self/map_files`, the very inode in use. `path`: the exporter lacked `CAP_SYS_ADMIN` for that and read the file at `path` |
-| `problems` | What a healthy exporter process does not have: `LD_PRELOAD`, `LD_AUDIT` or `LD_LIBRARY_PATH` set; a non-empty `/etc/ld.so.preload`; a tracer attached; an executable mapping that is neither the exporter, the C runtime nor `libnvidia-ml` and its own `libnvidia-*` siblings; a `libnvidia-ml` outside the system library directories, or with a file or parent directory not owned by root or writable by group or others. Empty when none was seen |
+| `problems` | What a healthy exporter process does not have: `LD_PRELOAD`, `LD_AUDIT` or `LD_LIBRARY_PATH` set; a non-empty `/etc/ld.so.preload`; a tracer attached; an executable mapping that is neither the exporter, the C runtime nor `libnvidia-ml` and the driver libraries beside it (`libnvidia-*`, `libcuda`); a `libnvidia-ml` outside the system library directories, or with a file or parent directory not owned by root or writable by group or others. Empty when none was seen |
 | `error` | Set when the measurement itself failed; the other fields are then partial |
 
 What it cannot see: a modified NVIDIA kernel module (the open GPU kernel modules

@@ -285,8 +285,9 @@ func TestNVMLLibraryFlagsPlacement(t *testing.T) {
 
 // TestNVMLLibraryQuietOnHealthyVariants pins what must not be flagged, since a
 // problem that shows on healthy guests is one nobody reads: older glibc file
-// names, NSS modules, libnvidia-ml's own siblings, non-code mappings of any
-// file, and a C runtime upgraded under the running process.
+// names, NSS modules, the driver libraries beside libnvidia-ml (libcuda among
+// them, which NVML loads itself), non-code mappings of any file, and a C
+// runtime upgraded under the running process.
 func TestNVMLLibraryQuietOnHealthyVariants(t *testing.T) {
 	p := newFakeProcess(t)
 	p.mapFile("r-xp", filepath.Join(p.sysDir, "libc-2.31.so"))
@@ -295,10 +296,32 @@ func TestNVMLLibraryQuietOnHealthyVariants(t *testing.T) {
 	p.mapFile("r-xp", filepath.Join(p.sysDir, "libnss_files.so.2"))
 	p.mapFile("r-xp", filepath.Join(p.sysDir, "libm.so.6")+deletedSuffix)
 	p.mapFile("r-xp", filepath.Join(p.nvDir, "libnvidia-cfg.so.550.54.15"))
+	p.mapFile("r-xp", filepath.Join(p.nvDir, "libcuda.so.550.54.15"))
 	p.mapFile("r--p", filepath.Join(p.root, "tmp", "some-data-file"))
 
 	if lib := p.inspector().inspect(); len(lib.Problems) != 0 {
 		t.Fatalf("healthy variants flagged: %q", lib.Problems)
+	}
+}
+
+// TestNVMLLibraryFlagsDriverLibrariesElsewhere: libcuda and the libnvidia-*
+// family are expected for the directory they share with libnvidia-ml, not for
+// their names -- from anywhere else they are flagged like any other library.
+func TestNVMLLibraryFlagsDriverLibrariesElsewhere(t *testing.T) {
+	p := newFakeProcess(t)
+	elsewhere := []string{
+		filepath.Join(p.root, "opt", "libcuda.so.550.54.15"),
+		filepath.Join(p.root, "opt", "libnvidia-cfg.so.550.54.15"),
+	}
+	for _, f := range elsewhere {
+		p.mapFile("r-xp", f)
+	}
+
+	lib := p.inspector().inspect()
+	for _, f := range elsewhere {
+		if !hasProblem(lib.Problems, "unexpected library mapped: "+f) {
+			t.Errorf("%s not flagged: %q", f, lib.Problems)
+		}
 	}
 }
 

@@ -53,6 +53,12 @@ var systemLibPatterns = []string{
 	"libnss_*",
 }
 
+// driverLibPatterns are the NVIDIA driver's own libraries, expected only from
+// the directory libnvidia-ml was loaded from: the libnvidia-* family, and
+// libcuda, which NVML dlopens itself as libcuda.so.1 -- a 610 driver maps it
+// even when init fails with Driver Not Loaded.
+var driverLibPatterns = []string{"libnvidia-*", "libcuda.so.*"}
+
 // nvmlLibraryInspector measures the libnvidia-ml mapped into this process and
 // whatever could be intercepting it, for gpumetrics.NVMLLibrary. It judges
 // nothing: what it finds goes on the wire for the host to weigh. Every check
@@ -211,7 +217,7 @@ func (in *nvmlLibraryInspector) inspect() (lib gpumetrics.NVMLLibrary) {
 	}
 	mappings := executableMappings(maps)
 
-	// libnvidia-ml first: its directory vouches for its libnvidia-* siblings.
+	// libnvidia-ml first: its directory vouches for the driver libraries in it.
 	var nvml []mapping
 	nvmlLibDirs := map[string]bool{}
 	for _, m := range mappings {
@@ -226,7 +232,7 @@ func (in *nvmlLibraryInspector) inspect() (lib gpumetrics.NVMLLibrary) {
 		switch {
 		case m.name == in.exe, isNVMLLib(base):
 		case in.systemDirs[dir] && matchesAny(base, systemLibPatterns):
-		case nvmlLibDirs[dir] && strings.HasPrefix(base, "libnvidia-"):
+		case nvmlLibDirs[dir] && matchesAny(base, driverLibPatterns):
 		default:
 			if !slices.Contains(unexpected, m.path) {
 				unexpected = append(unexpected, m.path)
