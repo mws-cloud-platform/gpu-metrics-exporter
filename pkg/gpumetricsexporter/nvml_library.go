@@ -323,6 +323,55 @@ func (in *nvmlLibraryInspector) hashMapping(m mapping) (string, int64, string, e
 	return hex.EncodeToString(h.Sum(nil)), n, from, nil
 }
 
+// nvmlSoname is the name libnvidia-ml is loaded by, and the link a driver
+// install keeps pointing at its current build.
+const nvmlSoname = "libnvidia-ml.so.1"
+
+// staleNVML reports whether a new process would load another libnvidia-ml than
+// the one mapped into this one, and why: the mapped file was replaced on disk,
+// or the libnvidia-ml.so.1 beside it now leads to another file or to none.
+// Only then can a restart cure a driver/library version mismatch, since the
+// library stays mapped for the life of the process however often NVML is shut
+// down. When it cannot tell, it says yes: the restart the exporter always did.
+func (in *nvmlLibraryInspector) staleNVML() (bool, string) {
+	maps, err := os.ReadFile(filepath.Join(in.procSelf, "maps"))
+	if err != nil {
+		return true, fmt.Sprintf("reading the process mappings: %v", err)
+	}
+	var nvml []mapping
+	for _, m := range executableMappings(maps) {
+		if isNVMLLib(path.Base(m.name)) {
+			nvml = append(nvml, m)
+		}
+	}
+	if len(nvml) == 0 {
+		return true, "no libnvidia-ml mapped"
+	}
+	for _, m := range nvml {
+		if m.deleted() {
+			return true, "replaced on disk: " + m.path
+		}
+		// The mapped inode itself through map_files when permitted; else the
+		// path, which still names it unless the file was replaced -- and a
+		// replaced one shows as " (deleted)".
+		mapped, err := os.Stat(filepath.Join(in.procSelf, "map_files", m.addr))
+		if err != nil {
+			if mapped, err = os.Stat(m.name); err != nil {
+				return true, err.Error()
+			}
+		}
+		link := path.Join(path.Dir(m.name), nvmlSoname)
+		current, err := os.Stat(link)
+		if err != nil {
+			return true, err.Error()
+		}
+		if !os.SameFile(mapped, current) {
+			return true, fmt.Sprintf("%s leads to another file than the mapped %s", link, m.name)
+		}
+	}
+	return false, ""
+}
+
 // preloadEntries is the libraries /etc/ld.so.preload loads into every
 // process, comments and blank lines aside. A missing file is the normal case.
 func preloadEntries(file string) []string {

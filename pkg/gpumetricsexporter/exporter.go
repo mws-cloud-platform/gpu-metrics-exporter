@@ -40,7 +40,10 @@ type GpuMetricsExporter struct {
 	nvmlClient         nvml.Interface
 	lastNvmlLibPath    string
 	nvmlPathLogged     bool
-	onVersionMismatch  func(nvml.Return)
+	// onVersionMismatch exits for the supervisor to restart the exporter, once
+	// versionMismatch has found that a restart would load another library;
+	// tests swap it.
+	onVersionMismatch func(ret nvml.Return, staleLibrary string)
 	// initNVMLFn/shutdownNVMLFn are the NVML lifecycle calls behind
 	// initNVMLForTick/shutdownNVML, swappable in tests to drive the
 	// failure/retry/recovery paths without a GPU.
@@ -126,9 +129,9 @@ func NewGpuMetricsExporter(config GpuMetricsExporterConfig) *GpuMetricsExporter 
 	e.openAttestFn = openAttestDevice
 	e.nvmlLib = newNVMLLibraryInspector(config)
 	e.kmsg = newKmsgReader(log)
-	e.onVersionMismatch = func(ret nvml.Return) {
+	e.onVersionMismatch = func(ret nvml.Return, staleLibrary string) {
 		e.log.Fatal("NVML driver/library version mismatch detected, exiting for supervisor restart",
-			zap.String("error", nvml.ErrorString(ret)))
+			zap.String("error", nvml.ErrorString(ret)), zap.String("stale_library", staleLibrary))
 	}
 	// Initialize seqno to 0
 	e.seqno.Store(0)
@@ -182,10 +185,12 @@ func (e *GpuMetricsExporter) sendMetricsLoop(ctx context.Context) {
 // loop in the calling goroutine until the context is done. NVML is
 // initialized and shut down around every collection tick (see
 // initNVMLForTick), so a failed init is retried on the next tick and open
-// handles to device files are released between ticks. If a driver upgrade
-// causes a driver/library version mismatch, the exporter exits with a non-zero
-// code so its supervisor (systemd or kubelet) can restart it with a fresh address space.
-// The pci-attest device, by contrast, is opened once here for the whole run.
+// handles to device files are released between ticks. On a driver/library
+// version mismatch the exporter exits with a non-zero code for its supervisor
+// (systemd or kubelet) to restart it with a fresh address space, if that would
+// load another library, and otherwise reports the mismatch and carries on (see
+// versionMismatch). The pci-attest device, by contrast, is opened once here
+// for the whole run.
 func (e *GpuMetricsExporter) Run(ctx context.Context) error {
 	defer e.queryMetricsTicker.Stop()
 

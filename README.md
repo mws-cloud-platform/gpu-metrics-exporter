@@ -173,7 +173,7 @@ When changing the format:
 | `timestamp` | Collection time, Unix UTC seconds |
 | `version` | Exporter build version |
 | `start_time` | Exporter process start time, Unix UTC seconds |
-| `init_nvml_error` | Error from NVML initialization, empty on success |
+| `init_nvml_error` | Error from NVML initialization, empty on success. A driver/library version mismatch — driver packages upgraded with the reboot still pending, say — is reported here while everything else keeps shipping, and `nvidia_driver_version` and `nvml_library.path` carry the module's and the library's versions. The exporter restarts itself on one only when that would load another library: the module was reloaded under it after an upgrade |
 | `get_device_count_error` | Error from `DeviceGetCount`, empty on success |
 | `read_instance_id_error` | Error reading the instance ID, empty on success |
 | `read_nvidia_driver_version_error` | Error reading `/proc/driver/nvidia/version`, empty on success. The file exists only while the NVIDIA kernel module is loaded |
@@ -231,7 +231,9 @@ process and reports it, and the host decides what to trust:
   a thousand VMs on one driver version reporting one digest, and one reporting
   another, is the anomaly). That is the kernel module's version, not one the
   library reports about itself; exporters that predate the field leave only
-  `gpu_info[].driver_version`;
+  `gpu_info[].driver_version`. A payload whose `init_nvml_error` reports a
+  version mismatch is the exception: its library is another version than the
+  module by definition, and it carries no GPU numbers to vouch for;
 - treat a non-empty `problems` as a reason to distrust the payload's GPU numbers.
 
 | Field | Description |

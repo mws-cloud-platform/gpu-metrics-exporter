@@ -105,6 +105,24 @@ func (p *fakeProcess) linkMapFile(addr, target string) {
 	}
 }
 
+// linkSoname points libnvidia-ml.so.1 in the library directory at target, as a
+// driver install does.
+func (p *fakeProcess) linkSoname(target string) {
+	p.t.Helper()
+	link := filepath.Join(p.nvDir, nvmlSoname)
+	_ = os.Remove(link)
+	if err := os.Symlink(filepath.Base(target), link); err != nil {
+		p.t.Fatal(err)
+	}
+}
+
+// remapNVML replaces the mapping of libnvidia-ml with one of name and returns
+// its address range.
+func (p *fakeProcess) remapNVML(name string) string {
+	p.maps = slices.DeleteFunc(p.maps, func(l string) bool { return strings.Contains(l, "libnvidia-ml") })
+	return p.mapFile("r-xp", name)
+}
+
 func (p *fakeProcess) inspector() *nvmlLibraryInspector {
 	p.t.Helper()
 	p.write(filepath.Join(p.proc, "maps"), strings.Join(p.maps, "\n")+"\n", 0o644)
@@ -370,6 +388,82 @@ func TestNVMLLibrarySeveralCopies(t *testing.T) {
 	if !hasProblem(lib.Problems, "several libnvidia-ml mapped: ") {
 		t.Errorf("second copy not flagged: %q", lib.Problems)
 	}
+}
+
+// TestStaleNVML covers the question a driver/library version mismatch turns on:
+// would a new process load another libnvidia-ml than this one has mapped? Only
+// then can a restart cure it.
+func TestStaleNVML(t *testing.T) {
+	newer := func(p *fakeProcess) string {
+		f := filepath.Join(p.nvDir, "libnvidia-ml.so.550.90.07")
+		p.write(f, "a newer build", 0o644)
+		return f
+	}
+	for _, tc := range []struct {
+		name      string
+		setup     func(p *fakeProcess)
+		wantStale bool
+	}{
+		{"the current library, through map_files", func(p *fakeProcess) {
+			p.linkSoname(p.nvml)
+			p.linkMapFile(p.remapNVML(p.nvml), p.nvml)
+		}, false},
+		{"the current library, without map_files", func(p *fakeProcess) {
+			p.linkSoname(p.nvml)
+		}, false},
+		{"replaced on disk by an upgrade", func(p *fakeProcess) {
+			p.linkSoname(newer(p))
+			if err := os.Remove(p.nvml); err != nil {
+				p.t.Fatal(err)
+			}
+			p.remapNVML(p.nvml + deletedSuffix)
+		}, true},
+		{"reinstalled under the same name", func(p *fakeProcess) {
+			// The path and libnvidia-ml.so.1 agree on the new file; only the
+			// kernel's " (deleted)" says the mapped one is not it.
+			p.linkSoname(p.nvml)
+			p.write(p.nvml, "the same version, installed again", 0o644)
+			p.remapNVML(p.nvml + deletedSuffix)
+		}, true},
+		{"libnvidia-ml.so.1 leads to another build", func(p *fakeProcess) {
+			p.linkSoname(newer(p))
+		}, true},
+		{"the mapped inode is not the file at its path", func(p *fakeProcess) {
+			p.linkSoname(p.nvml)
+			mapped := filepath.Join(p.root, "mapped-inode")
+			p.write(mapped, genuineNVML, 0o644)
+			p.linkMapFile(p.remapNVML(p.nvml), mapped)
+		}, true},
+		{"no libnvidia-ml.so.1 to load any more", func(p *fakeProcess) {}, true},
+		{"no libnvidia-ml mapped", func(p *fakeProcess) {
+			p.linkSoname(p.nvml)
+			p.maps = slices.DeleteFunc(p.maps, func(l string) bool { return strings.Contains(l, "libnvidia-ml") })
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newFakeProcess(t)
+			tc.setup(p)
+			stale, why := p.inspector().staleNVML()
+			if stale != tc.wantStale {
+				t.Fatalf("stale = %v (%q), want %v", stale, why, tc.wantStale)
+			}
+			if stale && why == "" {
+				t.Error("stale without saying why")
+			}
+		})
+	}
+
+	t.Run("mappings unreadable", func(t *testing.T) {
+		p := newFakeProcess(t)
+		p.linkSoname(p.nvml)
+		in := p.inspector()
+		if err := os.Remove(filepath.Join(p.proc, "maps")); err != nil {
+			t.Fatal(err)
+		}
+		if stale, _ := in.staleNVML(); !stale {
+			t.Error("not stale although nothing could be checked; want the restart kept")
+		}
+	})
 }
 
 func TestCapProblems(t *testing.T) {

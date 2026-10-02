@@ -315,7 +315,9 @@ type XIDErrors struct {
 // builds of the driver version nvidia_driver_version names (the kernel
 // module's, not one this library reports about itself; exporters that predate
 // it leave only gpu_info[].driver_version), and Problems as a reason to
-// distrust this payload's GPU numbers.
+// distrust this payload's GPU numbers. A payload reporting a driver/library
+// version mismatch in init_nvml_error has another version by definition, and
+// no GPU numbers to vouch for.
 type NVMLLibrary struct {
 	// Error is set when the measurement itself failed; the other fields are
 	// then partial.

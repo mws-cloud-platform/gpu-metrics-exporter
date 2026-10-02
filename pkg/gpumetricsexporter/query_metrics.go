@@ -63,10 +63,9 @@ func (e *GpuMetricsExporter) getNVML() nvml.Interface {
 // where the driver is located in a GPU Operator container or host mount), it falls back
 // to probing well-known candidate paths via FindNVMLLibraryPath.
 //
-// If initialization returns ERROR_LIB_RM_VERSION_MISMATCH (e.g. after a driver upgrade,
-// where glibc marks the previously-loaded library as NODELETE), the exporter exits
-// with a non-zero code so the supervisor (systemd or kubelet) can restart it with
-// a fresh address space.
+// ERROR_LIB_RM_VERSION_MISMATCH -- the library and the loaded kernel module are
+// different driver versions -- goes to versionMismatch, which exits for the
+// supervisor to restart the exporter only when that would load another library.
 func (e *GpuMetricsExporter) initNVML() error {
 	if e.config.NvmlLibPath != "" {
 		resolvedLibPath := FindNVMLLibraryPath(e.config.NvmlLibPath, e.config.HostRoot)
@@ -74,7 +73,7 @@ func (e *GpuMetricsExporter) initNVML() error {
 		client := nvml.New(nvml.WithLibraryPath(resolvedLibPath))
 		ret := client.Init()
 		if ret == nvml.ERROR_LIB_RM_VERSION_MISMATCH {
-			e.onVersionMismatch(ret)
+			return e.versionMismatch(ret)
 		}
 		if ret != nvml.SUCCESS {
 			return fmt.Errorf("nvml init error %s", nvml.ErrorString(ret))
@@ -92,8 +91,7 @@ func (e *GpuMetricsExporter) initNVML() error {
 		return nil
 	}
 	if ret == nvml.ERROR_LIB_RM_VERSION_MISMATCH {
-		e.onVersionMismatch(ret)
-		return fmt.Errorf("nvml init error %s", nvml.ErrorString(ret))
+		return e.versionMismatch(ret)
 	}
 
 	// 2. If default system dlopen failed (e.g. running in a container where libnvidia-ml
@@ -103,8 +101,7 @@ func (e *GpuMetricsExporter) initNVML() error {
 		fallbackClient := nvml.New(nvml.WithLibraryPath(resolvedLibPath))
 		fallbackRet := fallbackClient.Init()
 		if fallbackRet == nvml.ERROR_LIB_RM_VERSION_MISMATCH {
-			e.onVersionMismatch(fallbackRet)
-			return fmt.Errorf("nvml fallback init error (%s): %s", resolvedLibPath, nvml.ErrorString(fallbackRet))
+			return fmt.Errorf("nvml fallback init error (%s): %w", resolvedLibPath, e.versionMismatch(fallbackRet))
 		}
 		if fallbackRet == nvml.SUCCESS {
 			e.logInitPath(resolvedLibPath)
@@ -116,6 +113,29 @@ func (e *GpuMetricsExporter) initNVML() error {
 	}
 
 	return fmt.Errorf("nvml init error %s", nvml.ErrorString(ret))
+}
+
+// versionMismatch handles ERROR_LIB_RM_VERSION_MISMATCH. It exits for the
+// supervisor to restart the exporter only when a new process would load
+// another libnvidia-ml (staleNVML): the kernel module was reloaded after an
+// upgrade replaced the library on disk, and this process cannot let go of the
+// old one. Otherwise -- driver packages upgraded with a reboot pending, or a
+// stale module loaded at boot -- a new process would fail its first tick the
+// same way, and exiting would only trade every payload, XID errors included,
+// for a restart loop until the module changes. Then it returns the tick's
+// error and the exporter carries on without GPU numbers; nvidia_driver_version
+// and nvml_library.path give the host both versions.
+func (e *GpuMetricsExporter) versionMismatch(ret nvml.Return) error {
+	err := fmt.Errorf("nvml init error %s", nvml.ErrorString(ret))
+	stale, why := true, "the NVML library is not inspected"
+	if e.nvmlLib != nil {
+		stale, why = e.nvmlLib.staleNVML()
+	}
+	if stale {
+		e.onVersionMismatch(ret, why)
+		return err
+	}
+	return fmt.Errorf("%w (not restarting: a new process would load the same libnvidia-ml)", err)
 }
 
 func (e *GpuMetricsExporter) logInitPath(path string) {
@@ -146,10 +166,13 @@ func (e *GpuMetricsExporter) logInitPath(path string) {
 //     exporter shipping empty metrics until the process is restarted.
 //
 // Note: glibc marks libnvidia-ml.so as NODELETE due to symbol references from cgo,
-// so dlclose() does not unmap the library from the process address space. If a driver
-// upgrade replaces the kernel driver and causes ERROR_LIB_RM_VERSION_MISMATCH, the
-// exporter terminates with a non-zero exit code so its supervisor (systemd or kubelet)
-// can restart it with a fresh address space.
+// so dlclose() does not unmap the library from the process address space, and a
+// later dlopen by the same name returns that copy even once the file on disk has
+// been replaced. Until a reboot the exporter thus keeps working on the library it
+// started with. If the kernel module is reloaded under it and NVML reports
+// ERROR_LIB_RM_VERSION_MISMATCH, versionMismatch exits for the supervisor (systemd
+// or kubelet) to restart it with a fresh address space -- when that would load
+// another library.
 //
 // Idempotent: a call with NVML already initialized is a no-op. A second Init
 // would bump NVML's refcount, and the single paired Shutdown would then
