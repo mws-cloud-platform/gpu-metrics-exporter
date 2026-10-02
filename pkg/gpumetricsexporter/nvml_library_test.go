@@ -1,6 +1,7 @@
 package gpumetricsexporter
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -103,6 +104,24 @@ func (p *fakeProcess) linkMapFile(addr, target string) {
 	if err := os.Symlink(target, filepath.Join(dir, addr)); err != nil {
 		p.t.Fatal(err)
 	}
+}
+
+// linkSoname points libnvidia-ml.so.1 in the library directory at target, as a
+// driver install does.
+func (p *fakeProcess) linkSoname(target string) {
+	p.t.Helper()
+	link := filepath.Join(p.nvDir, nvmlSoname)
+	_ = os.Remove(link)
+	if err := os.Symlink(filepath.Base(target), link); err != nil {
+		p.t.Fatal(err)
+	}
+}
+
+// remapNVML replaces the mapping of libnvidia-ml with one of name and returns
+// its address range.
+func (p *fakeProcess) remapNVML(name string) string {
+	p.maps = slices.DeleteFunc(p.maps, func(l string) bool { return strings.Contains(l, "libnvidia-ml") })
+	return p.mapFile("r-xp", name)
 }
 
 func (p *fakeProcess) inspector() *nvmlLibraryInspector {
@@ -285,8 +304,9 @@ func TestNVMLLibraryFlagsPlacement(t *testing.T) {
 
 // TestNVMLLibraryQuietOnHealthyVariants pins what must not be flagged, since a
 // problem that shows on healthy guests is one nobody reads: older glibc file
-// names, NSS modules, libnvidia-ml's own siblings, non-code mappings of any
-// file, and a C runtime upgraded under the running process.
+// names, NSS modules, the driver libraries beside libnvidia-ml (libcuda among
+// them, which NVML loads itself), non-code mappings of any file, and a C
+// runtime upgraded under the running process.
 func TestNVMLLibraryQuietOnHealthyVariants(t *testing.T) {
 	p := newFakeProcess(t)
 	p.mapFile("r-xp", filepath.Join(p.sysDir, "libc-2.31.so"))
@@ -295,10 +315,32 @@ func TestNVMLLibraryQuietOnHealthyVariants(t *testing.T) {
 	p.mapFile("r-xp", filepath.Join(p.sysDir, "libnss_files.so.2"))
 	p.mapFile("r-xp", filepath.Join(p.sysDir, "libm.so.6")+deletedSuffix)
 	p.mapFile("r-xp", filepath.Join(p.nvDir, "libnvidia-cfg.so.550.54.15"))
+	p.mapFile("r-xp", filepath.Join(p.nvDir, "libcuda.so.550.54.15"))
 	p.mapFile("r--p", filepath.Join(p.root, "tmp", "some-data-file"))
 
 	if lib := p.inspector().inspect(); len(lib.Problems) != 0 {
 		t.Fatalf("healthy variants flagged: %q", lib.Problems)
+	}
+}
+
+// TestNVMLLibraryFlagsDriverLibrariesElsewhere: libcuda and the libnvidia-*
+// family are expected for the directory they share with libnvidia-ml, not for
+// their names -- from anywhere else they are flagged like any other library.
+func TestNVMLLibraryFlagsDriverLibrariesElsewhere(t *testing.T) {
+	p := newFakeProcess(t)
+	elsewhere := []string{
+		filepath.Join(p.root, "opt", "libcuda.so.550.54.15"),
+		filepath.Join(p.root, "opt", "libnvidia-cfg.so.550.54.15"),
+	}
+	for _, f := range elsewhere {
+		p.mapFile("r-xp", f)
+	}
+
+	lib := p.inspector().inspect()
+	for _, f := range elsewhere {
+		if !hasProblem(lib.Problems, "unexpected library mapped: "+f) {
+			t.Errorf("%s not flagged: %q", f, lib.Problems)
+		}
 	}
 }
 
@@ -346,6 +388,144 @@ func TestNVMLLibrarySeveralCopies(t *testing.T) {
 	lib := p.inspector().inspect()
 	if !hasProblem(lib.Problems, "several libnvidia-ml mapped: ") {
 		t.Errorf("second copy not flagged: %q", lib.Problems)
+	}
+}
+
+// TestStaleNVML covers the question a driver/library version mismatch turns on:
+// would a new process load another libnvidia-ml than this one has mapped? Only
+// then can a restart cure it.
+func TestStaleNVML(t *testing.T) {
+	newer := func(p *fakeProcess) string {
+		f := filepath.Join(p.nvDir, "libnvidia-ml.so.550.90.07")
+		p.write(f, "a newer build", 0o644)
+		return f
+	}
+	for _, tc := range []struct {
+		name      string
+		setup     func(p *fakeProcess)
+		wantStale bool
+	}{
+		{"the current library, through map_files", func(p *fakeProcess) {
+			p.linkSoname(p.nvml)
+			p.linkMapFile(p.remapNVML(p.nvml), p.nvml)
+		}, false},
+		{"the current library, without map_files", func(p *fakeProcess) {
+			p.linkSoname(p.nvml)
+		}, false},
+		{"replaced on disk by an upgrade", func(p *fakeProcess) {
+			p.linkSoname(newer(p))
+			if err := os.Remove(p.nvml); err != nil {
+				p.t.Fatal(err)
+			}
+			p.remapNVML(p.nvml + deletedSuffix)
+		}, true},
+		{"reinstalled under the same name", func(p *fakeProcess) {
+			// The path and libnvidia-ml.so.1 agree on the new file; only the
+			// kernel's " (deleted)" says the mapped one is not it.
+			p.linkSoname(p.nvml)
+			p.write(p.nvml, "the same version, installed again", 0o644)
+			p.remapNVML(p.nvml + deletedSuffix)
+		}, true},
+		{"libnvidia-ml.so.1 leads to another build", func(p *fakeProcess) {
+			p.linkSoname(newer(p))
+		}, true},
+		{"the mapped inode is not the file at its path", func(p *fakeProcess) {
+			p.linkSoname(p.nvml)
+			mapped := filepath.Join(p.root, "mapped-inode")
+			p.write(mapped, genuineNVML, 0o644)
+			p.linkMapFile(p.remapNVML(p.nvml), mapped)
+		}, true},
+		{"no libnvidia-ml.so.1 to load any more", func(p *fakeProcess) {}, true},
+		{"no libnvidia-ml mapped", func(p *fakeProcess) {
+			p.linkSoname(p.nvml)
+			p.maps = slices.DeleteFunc(p.maps, func(l string) bool { return strings.Contains(l, "libnvidia-ml") })
+		}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newFakeProcess(t)
+			tc.setup(p)
+			stale, why := p.inspector().staleNVML()
+			if stale != tc.wantStale {
+				t.Fatalf("stale = %v (%q), want %v", stale, why, tc.wantStale)
+			}
+			if stale && why == "" {
+				t.Error("stale without saying why")
+			}
+		})
+	}
+
+	t.Run("mappings unreadable", func(t *testing.T) {
+		p := newFakeProcess(t)
+		p.linkSoname(p.nvml)
+		in := p.inspector()
+		if err := os.Remove(filepath.Join(p.proc, "maps")); err != nil {
+			t.Fatal(err)
+		}
+		if stale, _ := in.staleNVML(); !stale {
+			t.Error("not stale although nothing could be checked; want the restart kept")
+		}
+	})
+}
+
+// TestTracerWatcherCountsAttachments pins the counting: an attach is counted
+// once however many polls it spans, a fresh attach after a detach counts
+// again, and the running total rides on the payload even once the debugger is
+// gone -- which is the point, since an attach between ticks would otherwise
+// leave no trace.
+func TestTracerWatcherCountsAttachments(t *testing.T) {
+	p := newFakeProcess(t)
+	in := p.inspector()
+	setTracer := func(pid int) {
+		p.write(filepath.Join(p.proc, "status"), fmt.Sprintf("Name:\tx\nTracerPid:\t%d\n", pid), 0o644)
+	}
+
+	// No tracer: nothing counted.
+	in.pollTracer()
+	in.pollTracer()
+	if got := in.tracerCount.Load(); got != 0 {
+		t.Fatalf("count = %d with no tracer, want 0", got)
+	}
+
+	// A debugger attaches and stays for several polls: counted once.
+	setTracer(4321)
+	in.pollTracer()
+	in.pollTracer()
+	if c, pid := in.tracerCount.Load(), in.lastTracerPID.Load(); c != 1 || pid != 4321 {
+		t.Fatalf("count=%d pid=%d after one attach, want 1/4321", c, pid)
+	}
+
+	// Detaches, then a second debugger attaches: counted again, pid updated.
+	setTracer(0)
+	in.pollTracer()
+	setTracer(9999)
+	in.pollTracer()
+	if c, pid := in.tracerCount.Load(), in.lastTracerPID.Load(); c != 2 || pid != 9999 {
+		t.Fatalf("count=%d pid=%d after a second attach, want 2/9999", c, pid)
+	}
+
+	// The total is on the payload after the debugger has gone.
+	setTracer(0)
+	in.pollTracer()
+	if lib := in.inspect(); lib.TracedCount != 2 || lib.LastTracerPID != 9999 {
+		t.Errorf("payload traced_count=%d last_tracer_pid=%d, want 2/9999", lib.TracedCount, lib.LastTracerPID)
+	}
+}
+
+// TestWatchTracerSamplesImmediately pins the wiring: watchTracer takes a sample
+// before its first tick, so an attach present at startup is on the very first
+// payload, and it returns when the context is done.
+func TestWatchTracerSamplesImmediately(t *testing.T) {
+	p := newFakeProcess(t)
+	p.write(filepath.Join(p.proc, "status"), "Name:\tx\nTracerPid:\t777\n", 0o644)
+	e := &GpuMetricsExporter{log: zap.NewNop(), nvmlLib: p.inspector()}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // return after the immediate sample, before any ticker fire
+	e.wg.Add(1)
+	e.watchTracer(ctx)
+
+	if c, pid := e.nvmlLib.tracerCount.Load(), e.nvmlLib.lastTracerPID.Load(); c != 1 || pid != 777 {
+		t.Errorf("after the startup sample: count=%d pid=%d, want 1/777", c, pid)
 	}
 }
 
