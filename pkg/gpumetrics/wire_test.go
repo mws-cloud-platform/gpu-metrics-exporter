@@ -15,9 +15,11 @@ func sampleGpuMetrics() *GpuMetrics {
 		Seqno: 7, Timestamp: 1700000000, Version: "2026.06.08-2", StartTime: 1699999000,
 		InitNVMLError: "", GetDeviceCountError: "", ReadInstanceIDError: "",
 		SendMetricsErrorCount: 3, SendMetricsLastError: "boom",
+		ReadNvidiaDriverVersionError: "no NVRM version line",
 	}
 	m.NvFabricManagerStatus = NvFabricManagerStatus{Active: true, Enabled: true, NotDegraded: true}
 	m.XIDErrors = XIDErrors{XIDErrors: []string{"Xid 79 on GPU 0", "SXid 13"}, DroppedCount: 4, KernelLogLostCount: 9}
+	m.NvidiaDriverVersion = "550.54.15"
 	m.NVMLLibrary = NVMLLibrary{
 		Error:      "partial",
 		Path:       "/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.550.54.15",

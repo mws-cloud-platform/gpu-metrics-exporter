@@ -73,6 +73,9 @@ type GpuMetricsExporter struct {
 	// belong to the query goroutine.
 	nvmlLib               *nvmlLibraryInspector
 	lastNVMLLibraryReport string
+	// nvidiaDriverVersionPath is where the NVIDIA kernel module reports its
+	// version, swappable in tests.
+	nvidiaDriverVersionPath string
 }
 
 const (
@@ -110,10 +113,11 @@ func NewGpuMetricsExporter(config GpuMetricsExporterConfig) *GpuMetricsExporter 
 	}
 
 	e := &GpuMetricsExporter{
-		queryMetricsTicker: time.NewTicker(tickPeriod),
-		log:                log,
-		metricsQueue:       make(chan *gpumetrics.GpuMetrics, metricsQueueCapacity),
-		config:             config,
+		queryMetricsTicker:      time.NewTicker(tickPeriod),
+		log:                     log,
+		metricsQueue:            make(chan *gpumetrics.GpuMetrics, metricsQueueCapacity),
+		config:                  config,
+		nvidiaDriverVersionPath: nvidiaDriverVersionFile,
 	}
 	// NVML lifecycle defaults; tests swap these to drive the
 	// failure/retry/recovery paths without a GPU.

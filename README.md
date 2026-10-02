@@ -120,6 +120,7 @@ counter (`sbe_pages`, `correctable`, …), which every payload carries in full;
 | `wire_version` | Format version the exporter speaks (see [Wire format versioning](#wire-format-versioning)) |
 | `source.vsock_client_id` | Guest VM vsock CID, filled in by the receiver from the peer address |
 | `source.instance_id` | Cloud-init instance ID (read from `/var/lib/cloud/data/instance-id`) |
+| `nvidia_driver_version` | Version of the loaded NVIDIA kernel module (e.g. `550.54.15`), read from `/proc/driver/nvidia/version`. It comes from the module rather than NVML, so it is there on a tick whose NVML init failed, and unlike `gpu_info[].driver_version` it is not something the library `nvml_library` measures reports about itself. Empty when it could not be read — `exporter_info.read_nvidia_driver_version_error` says why; empty with no error means an exporter that predates the field |
 | `gpu_device_count` | Number of NVIDIA GPUs detected |
 
 ### Wire format versioning
@@ -175,6 +176,7 @@ When changing the format:
 | `init_nvml_error` | Error from NVML initialization, empty on success |
 | `get_device_count_error` | Error from `DeviceGetCount`, empty on success |
 | `read_instance_id_error` | Error reading the instance ID, empty on success |
+| `read_nvidia_driver_version_error` | Error reading `/proc/driver/nvidia/version`, empty on success. The file exists only while the NVIDIA kernel module is loaded |
 | `send_metrics_error_count` | Running total of send failures since start |
 | `send_metrics_last_error` | Last send failure message; cleared on the next successful send, so non-empty means the channel is broken *now* |
 
@@ -225,9 +227,11 @@ exporter judges nothing; each tick it measures what is actually mapped into its
 process and reports it, and the host decides what to trust:
 
 - compare `sha256` with the known builds of the driver version that
-  `gpu_info[].driver_version` names (NVIDIA's packages, or the fleet majority:
+  `nvidia_driver_version` names (NVIDIA's packages, or the fleet majority:
   a thousand VMs on one driver version reporting one digest, and one reporting
-  another, is the anomaly);
+  another, is the anomaly). That is the kernel module's version, not one the
+  library reports about itself; exporters that predate the field leave only
+  `gpu_info[].driver_version`;
 - treat a non-empty `problems` as a reason to distrust the payload's GPU numbers.
 
 | Field | Description |

@@ -259,6 +259,13 @@ func (e *GpuMetricsExporter) queryMetrics() (*gpumetrics.GpuMetrics, error) {
 		metrics.Source.InstanceID = instanceID
 	}
 
+	// From the kernel module, not NVML, so read whether or not init succeeded.
+	if version, err := e.readNvidiaDriverVersion(); err != nil {
+		metrics.ExporterInfo.ReadNvidiaDriverVersionError = fmt.Sprintf("e.readNvidiaDriverVersion error: %v", err)
+	} else {
+		metrics.NvidiaDriverVersion = version
+	}
+
 	metrics.ExporterInfo.Seqno = e.seqno.Add(1)
 	metrics.ExporterInfo.Timestamp = time.Now().UTC().Unix()
 	metrics.ExporterInfo.Version = e.config.Version
