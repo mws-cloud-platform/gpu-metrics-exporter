@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 
 	"go.mws.cloud/gpu-metrics-exporter/pkg/gpumetrics"
@@ -75,6 +76,14 @@ type nvmlLibraryInspector struct {
 	nvmlDirs    map[string]bool // where libnvidia-ml may come from
 	rootUID     uint32          // owner the library and its directories must have
 	chainTop    string          // the ownership walk up from the library stops here
+	// Debugger-attachment tally, maintained by pollTracer off a goroutine of
+	// its own while inspect reads it on the query goroutine -- hence atomics.
+	// tracerCount counts attachments (a none->attached transition), so one
+	// that attaches and detaches between ticks is still caught; lastTracerPID
+	// is the pid of the most recent. prevTraced belongs to pollTracer alone.
+	tracerCount   atomic.Int64
+	lastTracerPID atomic.Int64
+	prevTraced    bool
 }
 
 // newNVMLLibraryInspector inspects this process. libnvidia-ml may come from the
@@ -197,6 +206,11 @@ func (e *GpuMetricsExporter) inspectNVMLLibrary() gpumetrics.NVMLLibrary {
 func (in *nvmlLibraryInspector) inspect() (lib gpumetrics.NVMLLibrary) {
 	var problems []string
 	defer func() { lib.Problems = capProblems(problems) }()
+
+	// The cumulative debugger tally rides on every payload, whatever else this
+	// tick finds: it is the named return, so it survives the early exits below.
+	lib.TracedCount = in.tracerCount.Load()
+	lib.LastTracerPID = int(in.lastTracerPID.Load())
 
 	for _, v := range []string{"LD_PRELOAD", "LD_AUDIT", "LD_LIBRARY_PATH"} {
 		if val := in.getenv(v); val != "" {
@@ -387,6 +401,26 @@ func preloadEntries(file string) []string {
 		entries = append(entries, strings.Fields(line)...)
 	}
 	return entries
+}
+
+// pollTracer samples TracerPid once and counts a debugger attachment on the
+// transition from none to attached, so one that attaches and detaches between
+// ticks is caught all the same. watchTracer calls it far more often than once
+// a tick; inspect reports the running tally. This sees ptrace attachments --
+// gdb, strace -- not a privileged guest user's other routes into the process's
+// memory, which leave no tracer; like the rest of nvml_library it is a
+// tripwire for the host, not a guarantee.
+func (in *nvmlLibraryInspector) pollTracer() {
+	pid := tracerPid(filepath.Join(in.procSelf, "status"))
+	if pid == 0 {
+		in.prevTraced = false
+		return
+	}
+	if !in.prevTraced {
+		in.tracerCount.Add(1)
+		in.lastTracerPID.Store(int64(pid))
+	}
+	in.prevTraced = true
 }
 
 // tracerPid is the pid ptrace-attached to this process, 0 when none.

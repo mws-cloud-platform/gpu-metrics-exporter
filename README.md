@@ -234,7 +234,8 @@ process and reports it, and the host decides what to trust:
   `gpu_info[].driver_version`. A payload whose `init_nvml_error` reports a
   version mismatch is the exception: its library is another version than the
   module by definition, and it carries no GPU numbers to vouch for;
-- treat a non-empty `problems` as a reason to distrust the payload's GPU numbers.
+- treat a non-empty `problems`, or a `traced_count` higher than the last
+  payload's, as a reason to distrust the payload's GPU numbers.
 
 | Field | Description |
 | --- | --- |
@@ -242,6 +243,8 @@ process and reports it, and the host decides what to trust:
 | `sha256`, `size` | Digest and length of the mapped file |
 | `hashed_from` | `mapping`: read through `/proc/self/map_files`, the very inode in use. `path`: the exporter lacked `CAP_SYS_ADMIN` for that and read the file at `path` |
 | `problems` | What a healthy exporter process does not have: `LD_PRELOAD`, `LD_AUDIT` or `LD_LIBRARY_PATH` set; a non-empty `/etc/ld.so.preload`; a tracer attached; an executable mapping that is neither the exporter, the C runtime nor `libnvidia-ml` and the driver libraries beside it (`libnvidia-*`, `libcuda`); a `libnvidia-ml` outside the system library directories, or with a file or parent directory not owned by root or writable by group or others. Empty when none was seen |
+| `traced_count` | Cumulative count of debugger (ptrace) attachments to the exporter, sampled several times a second — so one that attaches and detaches between ticks is counted, unlike the point-in-time `traced by pid N` in `problems`. Watch the delta between payloads. It catches ordinary tools (`gdb`, `strace`), not a privileged guest user's other routes into process memory, which leave no tracer; a steady value proves nothing |
+| `last_tracer_pid` | Guest pid of the most recent attachment counted in `traced_count` |
 | `error` | Set when the measurement itself failed; the other fields are then partial |
 
 What it cannot see: a modified NVIDIA kernel module (the open GPU kernel modules

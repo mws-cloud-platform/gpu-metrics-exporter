@@ -1,6 +1,7 @@
 package gpumetricsexporter
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -464,6 +465,68 @@ func TestStaleNVML(t *testing.T) {
 			t.Error("not stale although nothing could be checked; want the restart kept")
 		}
 	})
+}
+
+// TestTracerWatcherCountsAttachments pins the counting: an attach is counted
+// once however many polls it spans, a fresh attach after a detach counts
+// again, and the running total rides on the payload even once the debugger is
+// gone -- which is the point, since an attach between ticks would otherwise
+// leave no trace.
+func TestTracerWatcherCountsAttachments(t *testing.T) {
+	p := newFakeProcess(t)
+	in := p.inspector()
+	setTracer := func(pid int) {
+		p.write(filepath.Join(p.proc, "status"), fmt.Sprintf("Name:\tx\nTracerPid:\t%d\n", pid), 0o644)
+	}
+
+	// No tracer: nothing counted.
+	in.pollTracer()
+	in.pollTracer()
+	if got := in.tracerCount.Load(); got != 0 {
+		t.Fatalf("count = %d with no tracer, want 0", got)
+	}
+
+	// A debugger attaches and stays for several polls: counted once.
+	setTracer(4321)
+	in.pollTracer()
+	in.pollTracer()
+	if c, pid := in.tracerCount.Load(), in.lastTracerPID.Load(); c != 1 || pid != 4321 {
+		t.Fatalf("count=%d pid=%d after one attach, want 1/4321", c, pid)
+	}
+
+	// Detaches, then a second debugger attaches: counted again, pid updated.
+	setTracer(0)
+	in.pollTracer()
+	setTracer(9999)
+	in.pollTracer()
+	if c, pid := in.tracerCount.Load(), in.lastTracerPID.Load(); c != 2 || pid != 9999 {
+		t.Fatalf("count=%d pid=%d after a second attach, want 2/9999", c, pid)
+	}
+
+	// The total is on the payload after the debugger has gone.
+	setTracer(0)
+	in.pollTracer()
+	if lib := in.inspect(); lib.TracedCount != 2 || lib.LastTracerPID != 9999 {
+		t.Errorf("payload traced_count=%d last_tracer_pid=%d, want 2/9999", lib.TracedCount, lib.LastTracerPID)
+	}
+}
+
+// TestWatchTracerSamplesImmediately pins the wiring: watchTracer takes a sample
+// before its first tick, so an attach present at startup is on the very first
+// payload, and it returns when the context is done.
+func TestWatchTracerSamplesImmediately(t *testing.T) {
+	p := newFakeProcess(t)
+	p.write(filepath.Join(p.proc, "status"), "Name:\tx\nTracerPid:\t777\n", 0o644)
+	e := &GpuMetricsExporter{log: zap.NewNop(), nvmlLib: p.inspector()}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // return after the immediate sample, before any ticker fire
+	e.wg.Add(1)
+	e.watchTracer(ctx)
+
+	if c, pid := e.nvmlLib.tracerCount.Load(), e.nvmlLib.lastTracerPID.Load(); c != 1 || pid != 777 {
+		t.Errorf("after the startup sample: count=%d pid=%d, want 1/777", c, pid)
+	}
 }
 
 func TestCapProblems(t *testing.T) {

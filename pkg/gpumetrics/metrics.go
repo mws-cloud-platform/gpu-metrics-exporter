@@ -341,6 +341,17 @@ type NVMLLibrary struct {
 	// libnvidia-ml's own, a libnvidia-ml outside the system library
 	// directories or writable by anyone but root. Empty means none was seen.
 	Problems []string `json:"problems"`
+	// TracedCount is the cumulative number of debugger (ptrace) attachments the
+	// exporter has seen on itself, sampled several times a second so one that
+	// attaches and detaches between ticks is counted all the same -- unlike the
+	// "traced by pid N" entry in Problems, which reports only a tracer attached
+	// at the moment of the tick. A rise since the last payload is a reason to
+	// distrust this one's GPU numbers. It catches ordinary tools (gdb, strace),
+	// not a privileged guest user's other routes into process memory, which
+	// leave no tracer; a steady value is no proof of integrity.
+	// LastTracerPID is the pid of the most recent attachment.
+	TracedCount   int64 `json:"traced_count"`
+	LastTracerPID int   `json:"last_tracer_pid"`
 }
 
 // GpuMetrics is the top-level payload exchanged between the guest exporter and

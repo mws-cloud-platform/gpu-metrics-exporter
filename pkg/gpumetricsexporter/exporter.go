@@ -93,6 +93,13 @@ const (
 	// the current fault) and the loss is counted, never silent.
 	maxUnsentXIDErrors = 128
 
+	// tracerPollInterval is how often watchTracer samples TracerPid. Far
+	// shorter than a tick (60 s deployed) so a debugger that attaches and
+	// detaches between ticks is still counted, yet just one small procfs read
+	// each time, so the cost is negligible. It bounds, but cannot close, the
+	// window in which a very brief attach slips by unseen.
+	tracerPollInterval = 250 * time.Millisecond
+
 	// xidStartupLookbackSlack is added to TickPeriod to bound how far back the
 	// first read of the kernel log reaches: the window the exporter used to
 	// give dmesg on every tick, so a restart neither re-ships the whole ring
@@ -181,6 +188,29 @@ func (e *GpuMetricsExporter) sendMetricsLoop(ctx context.Context) {
 	}
 }
 
+// watchTracer polls for a debugger attached to the exporter far more often
+// than the tick, so inspect's cumulative count catches an attach-and-detach
+// that would fall between two ticks. It samples once right away -- an attach
+// present at startup counts -- then on every tracerPollInterval until the
+// context is done.
+func (e *GpuMetricsExporter) watchTracer(ctx context.Context) {
+	defer e.wg.Done()
+	if e.nvmlLib == nil {
+		return
+	}
+	e.nvmlLib.pollTracer()
+	t := time.NewTicker(tracerPollInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			e.nvmlLib.pollTracer()
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
 // Run starts the exporter: launches the send goroutine and runs the query
 // loop in the calling goroutine until the context is done. NVML is
 // initialized and shut down around every collection tick (see
@@ -201,6 +231,9 @@ func (e *GpuMetricsExporter) Run(ctx context.Context) error {
 
 	e.wg.Add(1)
 	go e.sendMetricsLoop(ctx)
+
+	e.wg.Add(1)
+	go e.watchTracer(ctx)
 
 	e.queryMetricsLoop(ctx)
 	e.kmsg.closeDevice()
