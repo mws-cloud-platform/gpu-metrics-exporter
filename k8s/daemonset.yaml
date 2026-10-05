@@ -68,8 +68,8 @@ spec:
         mws.ru/gpu.present: "true"
       containers:
         - name: exporter
-          image: registry.mwsapis.ru/mws-mk8s-images/customer/gpu-metrics-exporter:v1.0.0
-          imagePullPolicy: IfNotPresent
+          image: registry.mwsapis.ru/mws-mk8s-images/customer/gpu-metrics-exporter:latest
+          imagePullPolicy: Always
           # privileged is required to read the kernel log (/dev/kmsg) and for host chroot execution
           securityContext:
             privileged: true
