@@ -14,6 +14,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 
 	"go.mws.cloud/gpu-metrics-exporter/pkg/gpumetrics"
@@ -53,6 +54,12 @@ var systemLibPatterns = []string{
 	"libnss_*",
 }
 
+// driverLibPatterns are the NVIDIA driver's own libraries, expected only from
+// the directory libnvidia-ml was loaded from: the libnvidia-* family, and
+// libcuda, which NVML dlopens itself as libcuda.so.1 -- a 610 driver maps it
+// even when init fails with Driver Not Loaded.
+var driverLibPatterns = []string{"libnvidia-*", "libcuda.so.*"}
+
 // nvmlLibraryInspector measures the libnvidia-ml mapped into this process and
 // whatever could be intercepting it, for gpumetrics.NVMLLibrary. It judges
 // nothing: what it finds goes on the wire for the host to weigh. Every check
@@ -69,6 +76,14 @@ type nvmlLibraryInspector struct {
 	nvmlDirs    map[string]bool // where libnvidia-ml may come from
 	rootUID     uint32          // owner the library and its directories must have
 	chainTop    string          // the ownership walk up from the library stops here
+	// Debugger-attachment tally, maintained by pollTracer off a goroutine of
+	// its own while inspect reads it on the query goroutine -- hence atomics.
+	// tracerCount counts attachments (a none->attached transition), so one
+	// that attaches and detaches between ticks is still caught; lastTracerPID
+	// is the pid of the most recent. prevTraced belongs to pollTracer alone.
+	tracerCount   atomic.Int64
+	lastTracerPID atomic.Int64
+	prevTraced    bool
 }
 
 // newNVMLLibraryInspector inspects this process. libnvidia-ml may come from the
@@ -192,6 +207,11 @@ func (in *nvmlLibraryInspector) inspect() (lib gpumetrics.NVMLLibrary) {
 	var problems []string
 	defer func() { lib.Problems = capProblems(problems) }()
 
+	// The cumulative debugger tally rides on every payload, whatever else this
+	// tick finds: it is the named return, so it survives the early exits below.
+	lib.TracedCount = in.tracerCount.Load()
+	lib.LastTracerPID = int(in.lastTracerPID.Load())
+
 	for _, v := range []string{"LD_PRELOAD", "LD_AUDIT", "LD_LIBRARY_PATH"} {
 		if val := in.getenv(v); val != "" {
 			problems = append(problems, fmt.Sprintf("%s is set: %s", v, truncate(val)))
@@ -211,7 +231,7 @@ func (in *nvmlLibraryInspector) inspect() (lib gpumetrics.NVMLLibrary) {
 	}
 	mappings := executableMappings(maps)
 
-	// libnvidia-ml first: its directory vouches for its libnvidia-* siblings.
+	// libnvidia-ml first: its directory vouches for the driver libraries in it.
 	var nvml []mapping
 	nvmlLibDirs := map[string]bool{}
 	for _, m := range mappings {
@@ -226,7 +246,7 @@ func (in *nvmlLibraryInspector) inspect() (lib gpumetrics.NVMLLibrary) {
 		switch {
 		case m.name == in.exe, isNVMLLib(base):
 		case in.systemDirs[dir] && matchesAny(base, systemLibPatterns):
-		case nvmlLibDirs[dir] && strings.HasPrefix(base, "libnvidia-"):
+		case nvmlLibDirs[dir] && matchesAny(base, driverLibPatterns):
 		default:
 			if !slices.Contains(unexpected, m.path) {
 				unexpected = append(unexpected, m.path)
@@ -317,6 +337,55 @@ func (in *nvmlLibraryInspector) hashMapping(m mapping) (string, int64, string, e
 	return hex.EncodeToString(h.Sum(nil)), n, from, nil
 }
 
+// nvmlSoname is the name libnvidia-ml is loaded by, and the link a driver
+// install keeps pointing at its current build.
+const nvmlSoname = "libnvidia-ml.so.1"
+
+// staleNVML reports whether a new process would load another libnvidia-ml than
+// the one mapped into this one, and why: the mapped file was replaced on disk,
+// or the libnvidia-ml.so.1 beside it now leads to another file or to none.
+// Only then can a restart cure a driver/library version mismatch, since the
+// library stays mapped for the life of the process however often NVML is shut
+// down. When it cannot tell, it says yes: the restart the exporter always did.
+func (in *nvmlLibraryInspector) staleNVML() (bool, string) {
+	maps, err := os.ReadFile(filepath.Join(in.procSelf, "maps"))
+	if err != nil {
+		return true, fmt.Sprintf("reading the process mappings: %v", err)
+	}
+	var nvml []mapping
+	for _, m := range executableMappings(maps) {
+		if isNVMLLib(path.Base(m.name)) {
+			nvml = append(nvml, m)
+		}
+	}
+	if len(nvml) == 0 {
+		return true, "no libnvidia-ml mapped"
+	}
+	for _, m := range nvml {
+		if m.deleted() {
+			return true, "replaced on disk: " + m.path
+		}
+		// The mapped inode itself through map_files when permitted; else the
+		// path, which still names it unless the file was replaced -- and a
+		// replaced one shows as " (deleted)".
+		mapped, err := os.Stat(filepath.Join(in.procSelf, "map_files", m.addr))
+		if err != nil {
+			if mapped, err = os.Stat(m.name); err != nil {
+				return true, err.Error()
+			}
+		}
+		link := path.Join(path.Dir(m.name), nvmlSoname)
+		current, err := os.Stat(link)
+		if err != nil {
+			return true, err.Error()
+		}
+		if !os.SameFile(mapped, current) {
+			return true, fmt.Sprintf("%s leads to another file than the mapped %s", link, m.name)
+		}
+	}
+	return false, ""
+}
+
 // preloadEntries is the libraries /etc/ld.so.preload loads into every
 // process, comments and blank lines aside. A missing file is the normal case.
 func preloadEntries(file string) []string {
@@ -332,6 +401,26 @@ func preloadEntries(file string) []string {
 		entries = append(entries, strings.Fields(line)...)
 	}
 	return entries
+}
+
+// pollTracer samples TracerPid once and counts a debugger attachment on the
+// transition from none to attached, so one that attaches and detaches between
+// ticks is caught all the same. watchTracer calls it far more often than once
+// a tick; inspect reports the running tally. This sees ptrace attachments --
+// gdb, strace -- not a privileged guest user's other routes into the process's
+// memory, which leave no tracer; like the rest of nvml_library it is a
+// tripwire for the host, not a guarantee.
+func (in *nvmlLibraryInspector) pollTracer() {
+	pid := tracerPid(filepath.Join(in.procSelf, "status"))
+	if pid == 0 {
+		in.prevTraced = false
+		return
+	}
+	if !in.prevTraced {
+		in.tracerCount.Add(1)
+		in.lastTracerPID.Store(int64(pid))
+	}
+	in.prevTraced = true
 }
 
 // tracerPid is the pid ptrace-attached to this process, 0 when none.

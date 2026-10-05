@@ -110,7 +110,8 @@ func gunzip(data []byte) ([]byte, error) {
 
 // upconvertV1 maps a v1 payload into the current shape.
 //
-// Fields v1 has no notion of (MIG, XIDErrors.DroppedCount) are left zero, and
+// Fields v1 has no notion of (MIG, XIDErrors.DroppedCount, and everything added
+// to v2 since, such as NvidiaDriverVersion) are left zero, and
 // WireVersion stays 1 to say so: those zeros mean "not reported by this
 // exporter", not "reported as zero".
 //
@@ -126,7 +127,18 @@ func upconvertV1(m1 *v1.GpuMetrics) *GpuMetrics {
 			VsockClientID: m1.Source.VsockClientID,
 			InstanceID:    m1.Source.InstanceID,
 		},
-		ExporterInfo:          ExporterInfo(m1.ExporterInfo),
+		ExporterInfo: ExporterInfo{
+			Seqno:                 m1.ExporterInfo.Seqno,
+			Timestamp:             m1.ExporterInfo.Timestamp,
+			Version:               m1.ExporterInfo.Version,
+			StartTime:             m1.ExporterInfo.StartTime,
+			InitNVMLError:         m1.ExporterInfo.InitNVMLError,
+			GetDeviceCountError:   m1.ExporterInfo.GetDeviceCountError,
+			ReadInstanceIDError:   m1.ExporterInfo.ReadInstanceIDError,
+			SendMetricsErrorCount: m1.ExporterInfo.SendMetricsErrorCount,
+			SendMetricsLastError:  m1.ExporterInfo.SendMetricsLastError,
+			// ReadNvidiaDriverVersionError: v1 never read the driver version.
+		},
 		NvFabricManagerStatus: NvFabricManagerStatus(m1.NvFabricManagerStatus),
 		XIDErrors: XIDErrors{
 			Error:     m1.XIDErrors.Error,

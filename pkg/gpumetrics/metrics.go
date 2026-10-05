@@ -268,15 +268,16 @@ type NvLinkState struct {
 // monotonically increasing sequence number, a timestamp, the build version, the
 // process start time, and any NVML/read/send errors observed so far.
 type ExporterInfo struct {
-	Seqno                 int64  `json:"seqno"`
-	Timestamp             int64  `json:"timestamp"`
-	Version               string `json:"version"`
-	StartTime             int64  `json:"start_time"`
-	InitNVMLError         string `json:"init_nvml_error"`
-	GetDeviceCountError   string `json:"get_device_count_error"`
-	ReadInstanceIDError   string `json:"read_instance_id_error"`
-	SendMetricsErrorCount int64  `json:"send_metrics_error_count"`
-	SendMetricsLastError  string `json:"send_metrics_last_error"`
+	Seqno                        int64  `json:"seqno"`
+	Timestamp                    int64  `json:"timestamp"`
+	Version                      string `json:"version"`
+	StartTime                    int64  `json:"start_time"`
+	InitNVMLError                string `json:"init_nvml_error"`
+	GetDeviceCountError          string `json:"get_device_count_error"`
+	ReadInstanceIDError          string `json:"read_instance_id_error"`
+	ReadNvidiaDriverVersionError string `json:"read_nvidia_driver_version_error"`
+	SendMetricsErrorCount        int64  `json:"send_metrics_error_count"`
+	SendMetricsLastError         string `json:"send_metrics_last_error"`
 }
 
 // NvFabricManagerStatus reports the health of the nvidia-fabricmanager service
@@ -311,8 +312,12 @@ type XIDErrors struct {
 // attested exporter report invented numbers. Inside the guest no check can rule
 // that out, so the exporter judges nothing -- it measures what is actually
 // mapped into it and reports that. The host decides: SHA256 against the known
-// builds of the driver version gpu_info[].driver_version names, and Problems as
-// a reason to distrust this payload's GPU numbers.
+// builds of the driver version nvidia_driver_version names (the kernel
+// module's, not one this library reports about itself; exporters that predate
+// it leave only gpu_info[].driver_version), and Problems as a reason to
+// distrust this payload's GPU numbers. A payload reporting a driver/library
+// version mismatch in init_nvml_error has another version by definition, and
+// no GPU numbers to vouch for.
 type NVMLLibrary struct {
 	// Error is set when the measurement itself failed; the other fields are
 	// then partial.
@@ -336,11 +341,23 @@ type NVMLLibrary struct {
 	// libnvidia-ml's own, a libnvidia-ml outside the system library
 	// directories or writable by anyone but root. Empty means none was seen.
 	Problems []string `json:"problems"`
+	// TracedCount is the cumulative number of debugger (ptrace) attachments the
+	// exporter has seen on itself, sampled several times a second so one that
+	// attaches and detaches between ticks is counted all the same -- unlike the
+	// "traced by pid N" entry in Problems, which reports only a tracer attached
+	// at the moment of the tick. A rise since the last payload is a reason to
+	// distrust this one's GPU numbers. It catches ordinary tools (gdb, strace),
+	// not a privileged guest user's other routes into process memory, which
+	// leave no tracer; a steady value is no proof of integrity.
+	// LastTracerPID is the pid of the most recent attachment.
+	TracedCount   int64 `json:"traced_count"`
+	LastTracerPID int   `json:"last_tracer_pid"`
 }
 
 // GpuMetrics is the top-level payload exchanged between the guest exporter and
 // the host receiver: provenance, exporter health, fabric-manager status, XID
-// errors, the NVML library measurement, and one GPUInfo entry per detected GPU.
+// errors, the NVIDIA kernel module's version, the NVML library measurement, and
+// one GPUInfo entry per detected GPU.
 type GpuMetrics struct {
 	// WireVersion is the format version the *exporter* spoke, not the shape of
 	// this struct: NewGpuMetricsFromBytes always returns the current shape,
@@ -354,9 +371,16 @@ type GpuMetrics struct {
 	ExporterInfo          ExporterInfo          `json:"exporter_info"`
 	NvFabricManagerStatus NvFabricManagerStatus `json:"nv_fabric_manager_status"`
 	XIDErrors             XIDErrors             `json:"xid_errors"`
-	NVMLLibrary           NVMLLibrary           `json:"nvml_library"`
-	GpuDeviceCount        int                   `json:"gpu_device_count"`
-	Gpus                  []GPUInfo             `json:"gpu_info"`
+	// NvidiaDriverVersion is the version of the loaded NVIDIA kernel module, as
+	// /proc/driver/nvidia/version reports it (e.g. "550.54.15"). It comes from
+	// the module rather than NVML, so it is there on a tick whose NVML init
+	// failed. Empty when it could not be read --
+	// ExporterInfo.ReadNvidiaDriverVersionError then says why -- and, with that
+	// error empty too, from an exporter that predates the field.
+	NvidiaDriverVersion string      `json:"nvidia_driver_version"`
+	NVMLLibrary         NVMLLibrary `json:"nvml_library"`
+	GpuDeviceCount      int         `json:"gpu_device_count"`
+	Gpus                []GPUInfo   `json:"gpu_info"`
 }
 
 // NewGpuMetrics returns a zero-value GpuMetrics ready to be populated.

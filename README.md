@@ -120,6 +120,7 @@ counter (`sbe_pages`, `correctable`, …), which every payload carries in full;
 | `wire_version` | Format version the exporter speaks (see [Wire format versioning](#wire-format-versioning)) |
 | `source.vsock_client_id` | Guest VM vsock CID, filled in by the receiver from the peer address |
 | `source.instance_id` | Cloud-init instance ID (read from `/var/lib/cloud/data/instance-id`) |
+| `nvidia_driver_version` | Version of the loaded NVIDIA kernel module (e.g. `550.54.15`), read from `/proc/driver/nvidia/version`. It comes from the module rather than NVML, so it is there on a tick whose NVML init failed, and unlike `gpu_info[].driver_version` it is not something the library `nvml_library` measures reports about itself. Empty when it could not be read — `exporter_info.read_nvidia_driver_version_error` says why; empty with no error means an exporter that predates the field |
 | `gpu_device_count` | Number of NVIDIA GPUs detected |
 
 ### Wire format versioning
@@ -172,9 +173,10 @@ When changing the format:
 | `timestamp` | Collection time, Unix UTC seconds |
 | `version` | Exporter build version |
 | `start_time` | Exporter process start time, Unix UTC seconds |
-| `init_nvml_error` | Error from NVML initialization, empty on success |
+| `init_nvml_error` | Error from NVML initialization, empty on success. A driver/library version mismatch — driver packages upgraded with the reboot still pending, say — is reported here while everything else keeps shipping, and `nvidia_driver_version` and `nvml_library.path` carry the module's and the library's versions. The exporter restarts itself on one only when that would load another library: the module was reloaded under it after an upgrade |
 | `get_device_count_error` | Error from `DeviceGetCount`, empty on success |
 | `read_instance_id_error` | Error reading the instance ID, empty on success |
+| `read_nvidia_driver_version_error` | Error reading `/proc/driver/nvidia/version`, empty on success. The file exists only while the NVIDIA kernel module is loaded |
 | `send_metrics_error_count` | Running total of send failures since start |
 | `send_metrics_last_error` | Last send failure message; cleared on the next successful send, so non-empty means the channel is broken *now* |
 
@@ -225,17 +227,24 @@ exporter judges nothing; each tick it measures what is actually mapped into its
 process and reports it, and the host decides what to trust:
 
 - compare `sha256` with the known builds of the driver version that
-  `gpu_info[].driver_version` names (NVIDIA's packages, or the fleet majority:
+  `nvidia_driver_version` names (NVIDIA's packages, or the fleet majority:
   a thousand VMs on one driver version reporting one digest, and one reporting
-  another, is the anomaly);
-- treat a non-empty `problems` as a reason to distrust the payload's GPU numbers.
+  another, is the anomaly). That is the kernel module's version, not one the
+  library reports about itself; exporters that predate the field leave only
+  `gpu_info[].driver_version`. A payload whose `init_nvml_error` reports a
+  version mismatch is the exception: its library is another version than the
+  module by definition, and it carries no GPU numbers to vouch for;
+- treat a non-empty `problems`, or a `traced_count` higher than the last
+  payload's, as a reason to distrust the payload's GPU numbers.
 
 | Field | Description |
 | --- | --- |
 | `path` | The mapped `libnvidia-ml` as the kernel names it (symlinks resolved; ` (deleted)` appended when the file was replaced on disk after loading, as a driver upgrade does). Empty when NVML did not load — `exporter_info.init_nvml_error` says why |
 | `sha256`, `size` | Digest and length of the mapped file |
 | `hashed_from` | `mapping`: read through `/proc/self/map_files`, the very inode in use. `path`: the exporter lacked `CAP_SYS_ADMIN` for that and read the file at `path` |
-| `problems` | What a healthy exporter process does not have: `LD_PRELOAD`, `LD_AUDIT` or `LD_LIBRARY_PATH` set; a non-empty `/etc/ld.so.preload`; a tracer attached; an executable mapping that is neither the exporter, the C runtime nor `libnvidia-ml` and its own `libnvidia-*` siblings; a `libnvidia-ml` outside the system library directories, or with a file or parent directory not owned by root or writable by group or others. Empty when none was seen |
+| `problems` | What a healthy exporter process does not have: `LD_PRELOAD`, `LD_AUDIT` or `LD_LIBRARY_PATH` set; a non-empty `/etc/ld.so.preload`; a tracer attached; an executable mapping that is neither the exporter, the C runtime nor `libnvidia-ml` and the driver libraries beside it (`libnvidia-*`, `libcuda`); a `libnvidia-ml` outside the system library directories, or with a file or parent directory not owned by root or writable by group or others. Empty when none was seen |
+| `traced_count` | Cumulative count of debugger (ptrace) attachments to the exporter, sampled several times a second — so one that attaches and detaches between ticks is counted, unlike the point-in-time `traced by pid N` in `problems`. Watch the delta between payloads. It catches ordinary tools (`gdb`, `strace`), not a privileged guest user's other routes into process memory, which leave no tracer; a steady value proves nothing |
+| `last_tracer_pid` | Guest pid of the most recent attachment counted in `traced_count` |
 | `error` | Set when the measurement itself failed; the other fields are then partial |
 
 What it cannot see: a modified NVIDIA kernel module (the open GPU kernel modules

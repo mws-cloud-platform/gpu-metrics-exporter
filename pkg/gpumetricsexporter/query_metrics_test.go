@@ -2,7 +2,9 @@ package gpumetricsexporter
 
 import (
 	"errors"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 
@@ -93,6 +95,75 @@ func TestInitNVMLForTick(t *testing.T) {
 		e.shutdownNVML()
 		if shutdowns != 1 {
 			t.Fatalf("shutdown called %d times, want 1", shutdowns)
+		}
+	})
+}
+
+// TestVersionMismatchRestartsOnlyWhenThatHelps pins the decision on a
+// driver/library version mismatch: exit for a restart when a new process would
+// load another libnvidia-ml, and otherwise carry on. The second is a driver
+// upgrade with the reboot still pending, where the exporter used to exit on
+// every first tick and ship nothing at all until the reboot.
+func TestVersionMismatchRestartsOnlyWhenThatHelps(t *testing.T) {
+	newExporter := func(p *fakeProcess) (*GpuMetricsExporter, *[]string) {
+		var exits []string
+		e := NewGpuMetricsExporter(GpuMetricsExporterConfig{
+			Log:            zap.NewNop(),
+			TickPeriod:     time.Hour,
+			InstanceIDPath: filepath.Join(p.root, "instance-id"),
+		})
+		e.nvmlLib = p.inspector()
+		e.onVersionMismatch = func(_ nvml.Return, staleLibrary string) { exits = append(exits, staleLibrary) }
+		return e, &exits
+	}
+
+	t.Run("reboot pending: no restart, the payload ships", func(t *testing.T) {
+		p := newFakeProcess(t)
+		p.linkSoname(p.nvml)
+		e, exits := newExporter(p)
+		e.initNVMLFn = func() error { return e.versionMismatch(nvml.ERROR_LIB_RM_VERSION_MISMATCH) }
+		e.nvidiaDriverVersionPath = filepath.Join(p.root, "version")
+		p.write(e.nvidiaDriverVersionPath, "NVRM version: NVIDIA UNIX x86_64 Kernel Module  550.40.07  Tue Jan  9 10:00:00 UTC 2024\n", 0o644)
+
+		m, err := e.queryMetrics()
+		if err != nil {
+			t.Fatalf("queryMetrics: %v", err)
+		}
+		if len(*exits) != 0 {
+			t.Fatalf("exited for a restart (%q) that would load the same library", *exits)
+		}
+		if !strings.Contains(m.ExporterInfo.InitNVMLError, "ERROR_LIB_RM_VERSION_MISMATCH") ||
+			!strings.Contains(m.ExporterInfo.InitNVMLError, "not restarting") {
+			t.Errorf("init_nvml_error = %q, want the mismatch and that the exporter stays up", m.ExporterInfo.InitNVMLError)
+		}
+		// Both versions reach the host: the module's, and the library's.
+		if m.NvidiaDriverVersion != "550.40.07" || m.NVMLLibrary.Path != p.nvml {
+			t.Errorf("nvidia_driver_version %q, nvml_library.path %q", m.NvidiaDriverVersion, m.NVMLLibrary.Path)
+		}
+	})
+
+	t.Run("library replaced on disk: restart", func(t *testing.T) {
+		p := newFakeProcess(t)
+		p.linkSoname(p.nvml)
+		p.remapNVML(p.nvml + deletedSuffix)
+		e, exits := newExporter(p)
+
+		if err := e.versionMismatch(nvml.ERROR_LIB_RM_VERSION_MISMATCH); err == nil {
+			t.Error("no error for the tick")
+		}
+		if len(*exits) != 1 || !strings.Contains((*exits)[0], p.nvml) {
+			t.Errorf("exits = %q, want one naming the replaced library", *exits)
+		}
+	})
+
+	t.Run("nothing to inspect: restart, as before", func(t *testing.T) {
+		p := newFakeProcess(t)
+		e, exits := newExporter(p)
+		e.nvmlLib = nil
+
+		_ = e.versionMismatch(nvml.ERROR_LIB_RM_VERSION_MISMATCH)
+		if len(*exits) != 1 {
+			t.Errorf("exited %d times, want 1", len(*exits))
 		}
 	})
 }

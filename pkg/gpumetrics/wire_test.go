@@ -15,16 +15,20 @@ func sampleGpuMetrics() *GpuMetrics {
 		Seqno: 7, Timestamp: 1700000000, Version: "2026.06.08-2", StartTime: 1699999000,
 		InitNVMLError: "", GetDeviceCountError: "", ReadInstanceIDError: "",
 		SendMetricsErrorCount: 3, SendMetricsLastError: "boom",
+		ReadNvidiaDriverVersionError: "no NVRM version line",
 	}
 	m.NvFabricManagerStatus = NvFabricManagerStatus{Active: true, Enabled: true, NotDegraded: true}
 	m.XIDErrors = XIDErrors{XIDErrors: []string{"Xid 79 on GPU 0", "SXid 13"}, DroppedCount: 4, KernelLogLostCount: 9}
+	m.NvidiaDriverVersion = "550.54.15"
 	m.NVMLLibrary = NVMLLibrary{
-		Error:      "partial",
-		Path:       "/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.550.54.15",
-		SHA256:     "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
-		Size:       2097152,
-		HashedFrom: "mapping",
-		Problems:   []string{"LD_PRELOAD is set: /tmp/libevil.so", "unexpected library mapped: /tmp/libevil.so"},
+		Error:         "partial",
+		Path:          "/usr/lib/x86_64-linux-gnu/libnvidia-ml.so.550.54.15",
+		SHA256:        "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+		Size:          2097152,
+		HashedFrom:    "mapping",
+		Problems:      []string{"LD_PRELOAD is set: /tmp/libevil.so", "unexpected library mapped: /tmp/libevil.so"},
+		TracedCount:   2,
+		LastTracerPID: 4321,
 	}
 	m.GpuDeviceCount = 2
 	m.Gpus = []GPUInfo{

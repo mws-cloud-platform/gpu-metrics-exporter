@@ -40,7 +40,10 @@ type GpuMetricsExporter struct {
 	nvmlClient         nvml.Interface
 	lastNvmlLibPath    string
 	nvmlPathLogged     bool
-	onVersionMismatch  func(nvml.Return)
+	// onVersionMismatch exits for the supervisor to restart the exporter, once
+	// versionMismatch has found that a restart would load another library;
+	// tests swap it.
+	onVersionMismatch func(ret nvml.Return, staleLibrary string)
 	// initNVMLFn/shutdownNVMLFn are the NVML lifecycle calls behind
 	// initNVMLForTick/shutdownNVML, swappable in tests to drive the
 	// failure/retry/recovery paths without a GPU.
@@ -73,6 +76,9 @@ type GpuMetricsExporter struct {
 	// belong to the query goroutine.
 	nvmlLib               *nvmlLibraryInspector
 	lastNVMLLibraryReport string
+	// nvidiaDriverVersionPath is where the NVIDIA kernel module reports its
+	// version, swappable in tests.
+	nvidiaDriverVersionPath string
 }
 
 const (
@@ -86,6 +92,13 @@ const (
 	// host returns. On overflow the oldest lines go first (the newest describe
 	// the current fault) and the loss is counted, never silent.
 	maxUnsentXIDErrors = 128
+
+	// tracerPollInterval is how often watchTracer samples TracerPid. Far
+	// shorter than a tick (60 s deployed) so a debugger that attaches and
+	// detaches between ticks is still counted, yet just one small procfs read
+	// each time, so the cost is negligible. It bounds, but cannot close, the
+	// window in which a very brief attach slips by unseen.
+	tracerPollInterval = 250 * time.Millisecond
 
 	// xidStartupLookbackSlack is added to TickPeriod to bound how far back the
 	// first read of the kernel log reaches: the window the exporter used to
@@ -110,10 +123,11 @@ func NewGpuMetricsExporter(config GpuMetricsExporterConfig) *GpuMetricsExporter 
 	}
 
 	e := &GpuMetricsExporter{
-		queryMetricsTicker: time.NewTicker(tickPeriod),
-		log:                log,
-		metricsQueue:       make(chan *gpumetrics.GpuMetrics, metricsQueueCapacity),
-		config:             config,
+		queryMetricsTicker:      time.NewTicker(tickPeriod),
+		log:                     log,
+		metricsQueue:            make(chan *gpumetrics.GpuMetrics, metricsQueueCapacity),
+		config:                  config,
+		nvidiaDriverVersionPath: nvidiaDriverVersionFile,
 	}
 	// NVML lifecycle defaults; tests swap these to drive the
 	// failure/retry/recovery paths without a GPU.
@@ -122,9 +136,9 @@ func NewGpuMetricsExporter(config GpuMetricsExporterConfig) *GpuMetricsExporter 
 	e.openAttestFn = openAttestDevice
 	e.nvmlLib = newNVMLLibraryInspector(config)
 	e.kmsg = newKmsgReader(log)
-	e.onVersionMismatch = func(ret nvml.Return) {
+	e.onVersionMismatch = func(ret nvml.Return, staleLibrary string) {
 		e.log.Fatal("NVML driver/library version mismatch detected, exiting for supervisor restart",
-			zap.String("error", nvml.ErrorString(ret)))
+			zap.String("error", nvml.ErrorString(ret)), zap.String("stale_library", staleLibrary))
 	}
 	// Initialize seqno to 0
 	e.seqno.Store(0)
@@ -174,14 +188,39 @@ func (e *GpuMetricsExporter) sendMetricsLoop(ctx context.Context) {
 	}
 }
 
+// watchTracer polls for a debugger attached to the exporter far more often
+// than the tick, so inspect's cumulative count catches an attach-and-detach
+// that would fall between two ticks. It samples once right away -- an attach
+// present at startup counts -- then on every tracerPollInterval until the
+// context is done.
+func (e *GpuMetricsExporter) watchTracer(ctx context.Context) {
+	defer e.wg.Done()
+	if e.nvmlLib == nil {
+		return
+	}
+	e.nvmlLib.pollTracer()
+	t := time.NewTicker(tracerPollInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-t.C:
+			e.nvmlLib.pollTracer()
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
 // Run starts the exporter: launches the send goroutine and runs the query
 // loop in the calling goroutine until the context is done. NVML is
 // initialized and shut down around every collection tick (see
 // initNVMLForTick), so a failed init is retried on the next tick and open
-// handles to device files are released between ticks. If a driver upgrade
-// causes a driver/library version mismatch, the exporter exits with a non-zero
-// code so its supervisor (systemd or kubelet) can restart it with a fresh address space.
-// The pci-attest device, by contrast, is opened once here for the whole run.
+// handles to device files are released between ticks. On a driver/library
+// version mismatch the exporter exits with a non-zero code for its supervisor
+// (systemd or kubelet) to restart it with a fresh address space, if that would
+// load another library, and otherwise reports the mismatch and carries on (see
+// versionMismatch). The pci-attest device, by contrast, is opened once here
+// for the whole run.
 func (e *GpuMetricsExporter) Run(ctx context.Context) error {
 	defer e.queryMetricsTicker.Stop()
 
@@ -192,6 +231,9 @@ func (e *GpuMetricsExporter) Run(ctx context.Context) error {
 
 	e.wg.Add(1)
 	go e.sendMetricsLoop(ctx)
+
+	e.wg.Add(1)
+	go e.watchTracer(ctx)
 
 	e.queryMetricsLoop(ctx)
 	e.kmsg.closeDevice()
