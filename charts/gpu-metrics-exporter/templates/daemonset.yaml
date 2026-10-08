@@ -1,0 +1,136 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "gpu-metrics-exporter.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gpu-metrics-exporter.labels" . | nindent 4 }}
+spec:
+  {{- with .Values.updateStrategy }}
+  updateStrategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "gpu-metrics-exporter.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      {{- with .Values.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      labels:
+        {{- include "gpu-metrics-exporter.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "gpu-metrics-exporter.serviceAccountName" . }}
+      {{- if .Values.hostPID }}
+      hostPID: true
+      {{- end }}
+      {{- if .Values.runtimeClassName }}
+      runtimeClassName: {{ .Values.runtimeClassName | quote }}
+      {{- end }}
+      {{- if .Values.priorityClassName }}
+      priorityClassName: {{ .Values.priorityClassName | quote }}
+      {{- end }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: exporter
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- with .Values.securityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          env:
+            - name: NVIDIA_VISIBLE_DEVICES
+              value: {{ .Values.env.nvidiaVisibleDevices | quote }}
+            - name: NVIDIA_DRIVER_CAPABILITIES
+              value: {{ .Values.env.nvidiaDriverCapabilities | quote }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          envFrom:
+            - configMapRef:
+                name: {{ include "gpu-metrics-exporter.fullname" . }}-config
+            {{- with .Values.extraEnvFrom }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            {{- if .Values.hostVolumes.devKmsg.enabled }}
+            - name: dev-kmsg
+              mountPath: {{ .Values.hostVolumes.devKmsg.mountPath }}
+              readOnly: true
+            {{- end }}
+            {{- if .Values.hostVolumes.runNvidia.enabled }}
+            - name: run-nvidia
+              mountPath: {{ .Values.hostVolumes.runNvidia.mountPath }}
+              mountPropagation: HostToContainer
+              readOnly: true
+            {{- end }}
+            {{- if .Values.hostVolumes.cloudInit.enabled }}
+            - name: cloud-init
+              mountPath: {{ .Values.hostVolumes.cloudInit.mountPath }}
+              readOnly: true
+            {{- end }}
+            {{- if .Values.hostVolumes.hostRoot.enabled }}
+            - name: host-root
+              mountPath: {{ .Values.hostVolumes.hostRoot.mountPath }}
+              readOnly: true
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+      volumes:
+        {{- if .Values.hostVolumes.devKmsg.enabled }}
+        - name: dev-kmsg
+          hostPath:
+            path: {{ .Values.hostVolumes.devKmsg.hostPath }}
+            type: CharDevice
+        {{- end }}
+        {{- if .Values.hostVolumes.runNvidia.enabled }}
+        - name: run-nvidia
+          hostPath:
+            path: {{ .Values.hostVolumes.runNvidia.hostPath }}
+            type: DirectoryOrCreate
+        {{- end }}
+        {{- if .Values.hostVolumes.cloudInit.enabled }}
+        - name: cloud-init
+          hostPath:
+            path: {{ .Values.hostVolumes.cloudInit.hostPath }}
+            type: DirectoryOrCreate
+        {{- end }}
+        {{- if .Values.hostVolumes.hostRoot.enabled }}
+        - name: host-root
+          hostPath:
+            path: {{ .Values.hostVolumes.hostRoot.hostPath }}
+            type: Directory
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}

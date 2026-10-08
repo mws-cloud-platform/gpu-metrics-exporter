@@ -1,0 +1,135 @@
+# Default values for gpu-metrics-exporter.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+image:
+  repository: registry.mwsapis.ru/mws-mk8s-system/registry-mk8s/mk8s/gpu-metrics-exporter
+  pullPolicy: Always
+  # Image tag
+  tag: "v1.0.2"
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+commonLabels: {}
+
+serviceAccount:
+  # Specifies whether a service account should be created
+  create: true
+  # Annotations to add to the service account
+  annotations: {}
+  # The name of the service account to use.
+  # If not set and create is true, a name is generated using the fullname template
+  name: ""
+
+podAnnotations: {}
+podLabels:
+  app.kubernetes.io/component: exporter
+
+# Use hostPID to allow chroot'd systemctl to interact with the host systemd
+hostPID: true
+
+podSecurityContext: {}
+
+# Container securityContext.
+# Note: privileged is required to read the kernel log (/dev/kmsg) and for host chroot execution.
+securityContext:
+  privileged: true
+
+# Runtime class name. Default is empty ("") because the exporter runs as privileged: true,
+# mounts /run/nvidia and /host, and automatically discovers driver libraries (libnvidia-ml.so)
+# in both host paths and GPU Operator container paths without requiring nvidia-container-toolkit hooks.
+# Leaving this empty allows the DaemonSet to start on GPU nodes before the NVIDIA GPU Operator
+# is installed, and seamlessly start collecting metrics once the operator/driver arrives.
+runtimeClassName: ""
+
+# DaemonSet update strategy
+updateStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxUnavailable: 1
+
+# Optional PriorityClass name (e.g. system-node-critical)
+priorityClassName: ""
+
+# Exporter configuration settings (injected via ConfigMap and environment variables)
+config:
+  # Destination vsock port on host CID 2
+  serverPort: 9999
+  # Collection interval in seconds
+  tickPeriod: 60
+  # Logging level: debug, info, warn, error
+  logLevel: info
+  # Explicit path to libnvidia-ml.so.1 (leave empty for auto-detection in GPU Operator paths)
+  nvmlLibPath: ""
+  # Path to cloud-init instance ID file inside container
+  instanceIdPath: /var/lib/cloud/data/instance-id
+  # Path where the host root filesystem is mounted inside container
+  hostRoot: /host
+
+# NVIDIA container environment settings
+env:
+  nvidiaVisibleDevices: "all"
+  nvidiaDriverCapabilities: "all"
+
+# Additional environment variables for the exporter container
+extraEnv: []
+# - name: CUSTOM_VAR
+#   value: "custom-value"
+
+# Additional environment sources (e.g. Secrets or ConfigMaps)
+extraEnvFrom: []
+# - secretRef:
+#     name: custom-secret
+
+resources:
+  requests:
+    cpu: 50m
+    memory: 64Mi
+  limits:
+    cpu: 250m
+    memory: 256Mi
+
+# Node selector to target nodes with GPU
+nodeSelector:
+  mk8s.mws.ru/gpu: "true"
+
+# Tolerations for GPU nodes and critical cluster components
+tolerations:
+  - operator: Exists
+
+affinity: {}
+
+# Host path volume mounts configuration
+hostVolumes:
+  # Kernel messages (/dev/kmsg) for XID error tracking
+  devKmsg:
+    enabled: true
+    hostPath: /dev/kmsg
+    mountPath: /dev/kmsg
+  # NVIDIA GPU Operator driver libraries
+  runNvidia:
+    enabled: true
+    hostPath: /run/nvidia
+    mountPath: /run/nvidia
+  # Cloud-init instance ID
+  cloudInit:
+    enabled: true
+    hostPath: /var/lib/cloud/data
+    mountPath: /var/lib/cloud/data
+  # Host root mount for chroot execution of systemctl (nvidia-fabricmanager status)
+  hostRoot:
+    enabled: true
+    hostPath: /
+    mountPath: /host
+
+# Additional volumes to mount
+extraVolumes: []
+# - name: extra-volume
+#   emptyDir: {}
+
+# Additional volume mounts
+extraVolumeMounts: []
+# - name: extra-volume
+#   mountPath: /mnt/extra
