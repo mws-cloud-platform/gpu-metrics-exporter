@@ -1,0 +1,15 @@
+apiVersion: v2
+name: gpu-metrics-exporter
+description: A Helm chart for deploying gpu-metrics-exporter DaemonSet on GPU worker nodes
+type: application
+version: v1.0.0
+appVersion: "v1.0.2"
+keywords:
+  - gpu
+  - nvidia
+  - metrics
+  - vsock
+  - monitoring
+home: https://github.com/mws-cloud-platform/gpu-metrics-exporter
+sources:
+  - https://github.com/mws-cloud-platform/gpu-metrics-exporter

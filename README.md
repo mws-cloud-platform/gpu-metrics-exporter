@@ -456,7 +456,14 @@ make docker-image DOCKER_IMAGE_NAME=<registry>/gpu-metrics-exporter:<tag>
 docker push <registry>/gpu-metrics-exporter:<tag>
 ```
 
-2. Apply the DaemonSet manifest:
+2. Deploy using Helm (recommended):
+```bash
+helm upgrade --install gpu-metrics-exporter ./charts/gpu-metrics-exporter \
+  --namespace kube-system \
+  --create-namespace
+```
+
+Or apply raw Kubernetes manifests:
 ```bash
 kubectl apply -f k8s/daemonset.yaml
 ```

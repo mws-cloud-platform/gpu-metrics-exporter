@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "gpu-metrics-exporter.fullname" . }}-config
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "gpu-metrics-exporter.labels" . | nindent 4 }}
+data:
+  # Port on the hypervisor host listening for vsock connections
+  GPU_METRICS_EXPORTER_SERVER_PORT: {{ .Values.config.serverPort | quote }}
+  SERVER_PORT: {{ .Values.config.serverPort | quote }}
+  # Metric collection period in seconds
+  GPU_METRICS_EXPORTER_TICK_PERIOD: {{ .Values.config.tickPeriod | quote }}
+  TICK_PERIOD: {{ .Values.config.tickPeriod | quote }}
+  # Log level (debug, info, warn, error)
+  GPU_METRICS_EXPORTER_LOG_LEVEL: {{ .Values.config.logLevel | quote }}
+  LOG_LEVEL: {{ .Values.config.logLevel | quote }}
+  # Explicit path to libnvidia-ml.so.1 (leave empty for auto-detection in GPU Operator paths)
+  GPU_METRICS_EXPORTER_NVML_LIB_PATH: {{ .Values.config.nvmlLibPath | quote }}
+  NVML_LIB_PATH: {{ .Values.config.nvmlLibPath | quote }}
+  # Path to cloud-init instance-id file inside container
+  GPU_METRICS_EXPORTER_INSTANCE_ID_PATH: {{ .Values.config.instanceIdPath | quote }}
+  INSTANCE_ID_PATH: {{ .Values.config.instanceIdPath | quote }}
+  # Path where the host root filesystem is mounted inside container
+  GPU_METRICS_EXPORTER_HOST_ROOT: {{ .Values.config.hostRoot | quote }}
+  HOST_ROOT: {{ .Values.config.hostRoot | quote }}

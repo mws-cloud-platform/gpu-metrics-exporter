@@ -1,0 +1,18 @@
+gpu-metrics-exporter has been deployed.
+
+Release: {{ .Release.Name }}
+Namespace: {{ .Release.Namespace }}
+
+Check the DaemonSet rollout status:
+  kubectl --namespace {{ .Release.Namespace }} rollout status daemonset/{{ include "gpu-metrics-exporter.fullname" . }}
+
+Check running pods:
+  kubectl --namespace {{ .Release.Namespace }} get pods -l {{ include "gpu-metrics-exporter.selectorLabels" . | replace ": " "=" | replace "\n" "," }} -o wide
+
+View logs:
+  kubectl --namespace {{ .Release.Namespace }} logs -l {{ include "gpu-metrics-exporter.selectorLabels" . | replace ": " "=" | replace "\n" "," }} -f --tail=100
+
+WARNING:
+Do not run both the systemd (.deb) service and the Kubernetes DaemonSet on the same node / VM.
+If the host already runs the systemd service, disable it first:
+  sudo systemctl disable --now gpu-metrics-exporter

@@ -55,20 +55,18 @@ spec:
         app.kubernetes.io/component: exporter
     spec:
       serviceAccountName: gpu-metrics-exporter
-      # runtimeClassName: nvidia enables NVIDIA Container Toolkit runtime hooks
-      # to inject driver libraries (libnvidia-ml.so) and GPU device nodes
-      runtimeClassName: nvidia
+      hostPID: true
+      # runtimeClassName is omitted by default so the exporter can deploy on GPU nodes before
+      # NVIDIA GPU Operator is installed. The exporter runs as privileged: true, mounts /run/nvidia
+      # and /host, and automatically discovers driver libraries (libnvidia-ml.so) once the operator/driver arrives.
+      # runtimeClassName: nvidia
       tolerations:
-        - key: mws.ru/gpu.present
-          operator: Exists
-          effect: NoSchedule
-        - key: CriticalAddonsOnly
-          operator: Exists
+        - operator: Exists
       nodeSelector:
-        mws.ru/gpu.present: "true"
+        mk8s.mws.ru/gpu: "true"
       containers:
         - name: exporter
-          image: registry.mwsapis.ru/mws-mk8s-images/customer/gpu-metrics-exporter:latest
+          image: registry.mwsapis.ru/mws-mk8s-system/registry-mk8s/mk8s/gpu-metrics-exporter:v1.0.2
           imagePullPolicy: Always
           # privileged is required to read the kernel log (/dev/kmsg) and for host chroot execution
           securityContext:
