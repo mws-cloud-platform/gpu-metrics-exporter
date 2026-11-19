@@ -468,6 +468,104 @@ Or apply raw Kubernetes manifests:
 kubectl apply -f k8s/daemonset.yaml
 ```
 
+## Updating
+
+On a VM where the exporter was installed from the `.deb`, one command upgrades
+it to the latest GitHub release and restarts the service:
+
+```bash
+sudo gpu-metrics-exporter update      # upgrade to the latest release
+gpu-metrics-exporter update -check    # only report whether a newer one exists (needs no root)
+```
+
+It asks the GitHub API for the latest release, compares its tag with the
+version dpkg has installed, downloads `gpu-metrics-exporter_<tag>_amd64.deb`
+and installs it with `dpkg -i`. Before installing, it checks that the file is
+the release's asset: fetched over https only (redirects included), with the
+size and sha256 GitHub recorded when it was uploaded. It also checks that the
+package's control file names `gpu-metrics-exporter`, `amd64` and the release's
+own version, so an old package republished under a newer tag is refused.
+
+The service is left as it was, enabled or disabled, running or stopped. If it
+was running, it now runs the new binary. Every release's maintainer scripts
+disable and stop the service, then enable and start it again, whatever state it
+was in, so `update` restores that state itself. A stopped service is a special
+case: installing the package would start it, and on a Kubernetes node, where
+the DaemonSet runs the exporter, two exporters on one VM corrupt each other's
+stream (see [above](#mutual-exclusion-with-systemd-deb-package)). So `update`
+refuses while the service is stopped, unless given `-force`, which updates
+anyway and stops the service again right after.
+
+| Flag | Effect |
+| --- | --- |
+| `-check` | Report whether a newer release exists; change nothing |
+| `-force` | Install the latest release even when it is not newer than the installed one, when the installed version cannot be compared (a development build), or while the service is stopped |
+
+`update` refuses to run:
+
+- **in a Kubernetes pod.** There the exporter comes from the DaemonSet's image,
+  which the cluster admin rolls out (`helm upgrade`, or a new image tag);
+- without root, or on a system not running systemd;
+- **where the package is not installed.** `update` upgrades; it does not
+  install. Install the first `.deb` by hand.
+
+Releases up to and including `2026.10.06-1` do not know the command: they
+ignore the argument and start a second exporter in the foreground, next to the
+service. Upgrade those once by hand
+(`sudo dpkg -i gpu-metrics-exporter_<tag>_amd64.deb`). From then on, `update`
+works, and [auto-update](#auto-update) is on.
+
+`update` needs https access to `api.github.com`, `github.com` and
+`release-assets.githubusercontent.com`, where downloads redirect. It honours
+`HTTPS_PROXY`, which `sudo` drops by default, so pass it through explicitly:
+`sudo HTTPS_PROXY=http://proxy:3128 gpu-metrics-exporter update`. GitHub allows
+60 unauthenticated API requests an hour per IP address. At one check every
+8 hours, that is about 480 VMs sharing one public address.
+
+What the checks establish is that the bytes are the release's. They do not
+establish who published the release: anyone who can upload to this
+repository's releases can publish a matching digest. That is the same trust as
+downloading the `.deb` from the release page by hand. The pci-attest signature
+covers the exporter's code pages, not the package or its maintainer scripts,
+and those run as root.
+
+### Auto-update
+
+The package also installs a systemd timer that runs the same update every
+8 hours. Each check is delayed by up to another hour at random, so a fleet does
+not check, or roll out a release, all at once.
+
+```bash
+gpu-metrics-exporter auto-update status          # on or off, next and last check (needs no root)
+sudo gpu-metrics-exporter auto-update disable    # turn it off
+sudo gpu-metrics-exporter auto-update enable     # turn it back on
+```
+
+Auto-update is on by default. The package turns it on whenever it installs the
+timer for the first time: on a fresh install, on the upgrade from a release
+without it, and on a reinstall after removal. After that, the setting is the
+admin's and upgrades keep it. The setting is the timer's own: `auto-update
+disable` is `systemctl disable --now gpu-metrics-exporter-update.timer`, and
+either one lasts.
+
+An automatic update (`gpu-metrics-exporter-update.service`, which runs
+`update -auto`) does what `update` does, with two differences:
+
+- **It leaves a stopped service alone** instead of refusing. On a Kubernetes
+  node whose DaemonSet runs the exporter, the timer therefore does nothing.
+- **A failure before anything was installed exits with status 75**, which the
+  unit counts as success. That covers no route to GitHub, a rate limit, or a
+  download that does not check out. The next check tries again, and a VM
+  without access to GitHub does not show a failed unit three times a day. A
+  failed install does fail the unit.
+
+Each run's output is in `journalctl -u gpu-metrics-exporter-update`.
+
+Auto-update follows GitHub's *latest* release, so every VM picks up a new
+release within about 9 hours of its publication: publishing a release rolls it
+out. A release published as a prerelease, or not marked as latest, is left
+alone.
+
 ## How to build
 ```bash
 make docker-build

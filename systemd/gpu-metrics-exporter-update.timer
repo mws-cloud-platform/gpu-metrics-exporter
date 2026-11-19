@@ -1,0 +1,19 @@
+[Unit]
+Description=Check for a new gpu-metrics-exporter release every 8 hours
+Documentation=https://github.com/mws-cloud-platform/gpu-metrics-exporter#auto-update
+
+# Auto-update: `gpu-metrics-exporter auto-update enable|disable|status`. The
+# package enables this timer when it first installs it, and leaves it as it
+# finds it on every upgrade after that.
+[Timer]
+# 15 minutes after the timer starts -- at boot, or when auto-update is turned
+# on -- then 8 hours after each check. Not OnBootSec=: a timer started after
+# that point has passed fires at once, which, started from the package's
+# postinst, would run an update in the middle of the dpkg run installing it.
+OnActiveSec=15min
+OnUnitActiveSec=8h
+# Spread the fleet's checks, and with them a new release's rollout.
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target

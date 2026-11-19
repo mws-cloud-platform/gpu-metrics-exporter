@@ -1,3 +1,6 @@
 #!/bin/sh
 set -e
 systemctl daemon-reload
+if [ "$1" = purge ]; then
+	rm -rf /var/lib/gpu-metrics-exporter
+fi
