@@ -157,7 +157,7 @@ func (u *Updater) Update(ctx context.Context) error {
 	default:
 		u.printf("the installed version is newer than the latest release\n")
 	}
-	if u.CheckOnly || !(newer || u.Force) {
+	if u.CheckOnly || (!newer && !u.Force) {
 		return nil
 	}
 
