@@ -1,8 +1,35 @@
 package main
 
 import (
+	"errors"
+	"fmt"
 	"testing"
+
+	"go.mws.cloud/gpu-metrics-exporter/internal/selfupdate"
 )
+
+// Only an automatic run that changed nothing may exit ExitTempFail, which the
+// update unit counts as success; a failed install must fail the unit.
+func TestUpdateExitCode(t *testing.T) {
+	checkFailed := errors.New("query the latest release: GitHub API: 502 Bad Gateway")
+	installFailed := fmt.Errorf("wrapped: %w", &selfupdate.InstallError{Err: errors.New("dpkg -i: exit status 1")})
+	for _, tc := range []struct {
+		err  error
+		auto bool
+		want int
+	}{
+		{nil, false, 0},
+		{nil, true, 0},
+		{checkFailed, false, 1},
+		{checkFailed, true, selfupdate.ExitTempFail},
+		{installFailed, false, 1},
+		{installFailed, true, 1},
+	} {
+		if got := updateExitCode(tc.err, tc.auto); got != tc.want {
+			t.Errorf("updateExitCode(%v, auto %v) = %d, want %d", tc.err, tc.auto, got, tc.want)
+		}
+	}
+}
 
 func TestGetEnv(t *testing.T) {
 	primary := "GPU_METRICS_EXPORTER_TEST_STR"
