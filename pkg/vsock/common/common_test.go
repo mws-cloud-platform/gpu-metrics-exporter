@@ -358,3 +358,37 @@ func TestReadDeadlineExpiredBeforeRead(t *testing.T) {
 		t.Fatalf("expected os.ErrDeadlineExceeded, got %v", err)
 	}
 }
+
+func TestWriteDeadlineExceeded(t *testing.T) {
+	sender, _ := newSocketpairConns(t)
+	if err := unix.SetsockoptInt(sender.fd, unix.SOL_SOCKET, unix.SO_SNDBUF, 4096); err != nil {
+		t.Fatal(err)
+	}
+	if err := sender.SetWriteDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		// The receiver never reads. writeAll must keep looping after a short
+		// write and eventually surface the absolute deadline, not hang.
+		done <- sender.writeAll(make([]byte, 1<<20))
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("writeAll error = %v, want deadline exceeded", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocked write did not honour its deadline")
+	}
+}
+
+func TestWriteDeadlineExpiredBeforeWrite(t *testing.T) {
+	sender, _ := newSocketpairConns(t)
+	if err := sender.SetDeadline(time.Now().Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sender.Write([]byte("x")); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("Write with expired SetDeadline = %v, want deadline exceeded", err)
+	}
+}

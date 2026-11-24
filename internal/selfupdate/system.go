@@ -67,11 +67,10 @@ func (u *Updater) installedVersion() (string, error) {
 	return version, nil
 }
 
-// checkPackage checks that the downloaded file is the package the release
-// promises: ours, for this architecture, and at the release's version. The
-// last one is what keeps an old package, republished under a newer tag, from
-// passing for an upgrade. dpkg-deb only reads the control file; it runs none
-// of the package's scripts.
+// checkPackage checks that the downloaded file is the package the host
+// promises: ours, for this architecture, and at the announced version. The
+// last one stops a different package from passing for the host's metadata.
+// dpkg-deb only reads the control file; it runs none of the package's scripts.
 func (u *Updater) checkPackage(path, tag string) error {
 	out, err := u.cmd.output("dpkg-deb", "--field", path, "Package", "Version", "Architecture")
 	if err != nil {

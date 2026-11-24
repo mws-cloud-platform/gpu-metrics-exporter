@@ -55,6 +55,10 @@ func getEnvInt(primaryKey, fallbackKey string, defaultVal int) (int, error) {
 	return i, nil
 }
 
+func defaultServerPort() (int, error) {
+	return getEnvInt("GPU_METRICS_EXPORTER_SERVER_PORT", "SERVER_PORT", 1234)
+}
+
 func main() {
 	if len(os.Args) > 1 {
 		switch os.Args[1] {
@@ -65,7 +69,7 @@ func main() {
 		}
 	}
 
-	defaultPort, err := getEnvInt("GPU_METRICS_EXPORTER_SERVER_PORT", "SERVER_PORT", 1234)
+	defaultPort, err := defaultServerPort()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Configuration error: %v\n", err)
 		os.Exit(1)
@@ -90,7 +94,7 @@ func main() {
 	flag.Usage = func() {
 		out := flag.CommandLine.Output()
 		_, _ = fmt.Fprintf(out, "Usage:\n  %s [flags]                               run the exporter\n", os.Args[0])
-		_, _ = fmt.Fprintf(out, "  %s update [-check] [-force]              upgrade the installed package to the latest release\n", os.Args[0])
+		_, _ = fmt.Fprintf(out, "  %s update [-check] [-force]              upgrade the installed package to the host's version\n", os.Args[0])
 		_, _ = fmt.Fprintf(out, "  %s auto-update [enable|disable|status]   check for one every 8 hours, or stop doing so\n\nFlags:\n", os.Args[0])
 		flag.PrintDefaults()
 	}
@@ -147,20 +151,21 @@ func run(logger *zap.Logger, cfg gpumetricsexporter.GpuMetricsExporterConfig) er
 }
 
 // runUpdate is `gpu-metrics-exporter update`: upgrade the installed package
-// to the latest GitHub release (internal/selfupdate). It returns the exit code.
+// to the version served by the host over the existing metrics vsock port
+// (internal/selfupdate). It returns the exit code.
 func runUpdate(args []string) int {
 	fs := flag.NewFlagSet("update", flag.ContinueOnError)
-	check := fs.Bool("check", false, "only report whether a newer release exists; change nothing (needs no root)")
-	force := fs.Bool("force", false, "install the latest release even when it is not newer than the installed one, "+
+	check := fs.Bool("check", false, "only report whether the host has a newer package; change nothing (needs no root)")
+	force := fs.Bool("force", false, "install the host package even when it is not newer than the installed one, "+
 		"or while the service is stopped (it is left stopped)")
 	auto := fs.Bool("auto", false, fmt.Sprintf("run as auto-update's timer does: leave a stopped service alone, "+
 		"and exit %d when the update failed without changing anything", selfupdate.ExitTempFail))
 	fs.Usage = func() {
 		out := fs.Output()
 		_, _ = fmt.Fprintf(out, "Usage: %s update [-check] [-force]\n\n", os.Args[0])
-		_, _ = fmt.Fprintf(out, "Upgrade the installed gpu-metrics-exporter package to the latest release on\n"+
-			"github.com/%s, keeping its service enabled or disabled, running or stopped,\n"+
-			"as it was. Not for Kubernetes: there the DaemonSet's image is updated instead.\n\n", selfupdate.DefaultRepo)
+		_, _ = fmt.Fprintf(out, "Upgrade the installed gpu-metrics-exporter package to the version served by\n"+
+			"the host over the existing metrics vsock port, keeping its service enabled or disabled,\n"+
+			"running or stopped, as it was. Not for Kubernetes: there the DaemonSet's image is updated instead.\n\n")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -175,12 +180,18 @@ func runUpdate(args []string) int {
 		return 2
 	}
 
+	port, err := defaultServerPort()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Configuration error: %v\n", err)
+		return 1
+	}
+
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	u := selfupdate.New(version)
+	u := selfupdate.New(version, port)
 	u.CheckOnly, u.Force, u.Auto = *check, *force, *auto
-	err := u.Update(ctx)
+	err = u.Update(ctx)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "update: %v\n", err)
 	}
@@ -190,7 +201,7 @@ func runUpdate(args []string) int {
 // updateExitCode is update's exit status. An automatic run that failed
 // before dpkg -i changed nothing, and exits selfupdate.ExitTempFail: the
 // next run tries again, and the update unit (SuccessExitStatus=75) does not
-// show as failed on a VM that cannot reach GitHub.
+// show as failed on a VM whose host update service is unavailable.
 func updateExitCode(err error, auto bool) int {
 	var installErr *selfupdate.InstallError
 	switch {
@@ -208,7 +219,7 @@ func updateExitCode(err error, auto bool) int {
 func runAutoUpdate(args []string) int {
 	usage := func() {
 		fmt.Fprintf(os.Stderr, "Usage: %s auto-update [enable|disable|status]\n\n"+
-			"Auto-update checks for a new release every 8 hours and installs it as update\n"+
+			"Auto-update checks for a new host package every 8 hours and installs it as update\n"+
 			"does; it is on unless turned off. enable and disable need root; status, the\n"+
 			"default, does not. Not for Kubernetes: there the DaemonSet's image is updated.\n", os.Args[0])
 	}
@@ -221,7 +232,7 @@ func runAutoUpdate(args []string) int {
 		return 2
 	}
 
-	u := selfupdate.New(version)
+	u := selfupdate.New(version, 0)
 	var err error
 	switch cmd {
 	case "enable":

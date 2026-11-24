@@ -52,18 +52,42 @@ The GPU metrics collector should convert CID into VMID, for example by parsing
 and searching in running qemu command lines.
 
 Guests are less trusted than the host, so the receiver bounds what one can
-consume. `GpuMetricsReceiverConfig` exposes three limits, each defaulted when
+consume. `GpuMetricsReceiverConfig` exposes these limits, each defaulted when
 left at zero:
 
 | Field | Default | Purpose |
 | --- | --- | --- |
-| `MaxConnections` | 64 | Total simultaneous guest connections |
+| `MaxConnections` | 64 | Total simultaneous guest connections, metrics and updates combined |
 | `MaxConnectionsPerCID` | 4 | Simultaneous connections from one VM |
 | `ReadTimeout` | 60 s | Per-frame read deadline |
+| `WriteTimeout` | 60 s | Per-response write deadline for package downloads |
 
-Connections over a limit are closed immediately. The read deadline is what stops
-a guest from opening a connection, sending a frame header, and going silent to
-pin a goroutine and an fd until the process exits.
+Connections over a limit are closed immediately. The read deadline stops a guest
+from sending a partial frame and going silent; the write deadline does the same
+when a guest stops reading an update response. Neither can pin a goroutine and
+an fd until the process exits.
+
+The same listener also serves exporter updates. To enable that path, set both
+environment variables on the receiver:
+
+```text
+GPU_METRICS_RECEIVER_EXPORTER_DEB=/packages/gpu-metrics-exporter_2026.11.24-1_amd64.deb
+GPU_METRICS_RECEIVER_EXPORTER_VERSION=2026.11.24-1
+```
+
+The receiver runs no external commands and never invokes `dpkg-deb`, so this
+also works in a minimal pod with the package mounted read-only. The operator
+supplies the version through the second variable. At startup the receiver opens
+the regular file, checks that it is no larger than 64 MiB, and calculates its
+SHA-256. Guests get that version, size and digest, then verify the downloaded
+package's control file themselves. A mismatch between the environment version
+and the package is therefore rejected before installation.
+
+The open file, metadata and digest form one snapshot. Replace the package path
+atomically and restart the receiver to publish another version; in-place edits
+or an environment change do not reload it. If both variables are empty, metrics
+work normally and update requests receive an explicit "unavailable" error.
+Setting only one is a startup configuration error.
 
 ### Attested channel (pci-attest)
 The exporter also hands every payload to the QEMU `pci-attest` device (PCI id
@@ -127,9 +151,11 @@ counter (`sbe_pages`, `correctable`, …), which every payload carries in full;
 
 The exporter runs inside a guest VM. Exporter and receiver ship as independent
 `.deb` packages, and an exporter can stay deployed for a long time, so the
-receiver must decode every format version it has ever shipped. The protocol is
-one-way — the exporter never reads anything back — so all compatibility work
-lives on the receiver.
+receiver must decode every format version it has ever shipped. The metrics
+protocol is one-way — the exporter never reads a metrics response — so all
+metrics compatibility work lives on the receiver. The separate update protocol
+on the same port is request/response and has its own version; it does not alter
+`wire_version`.
 
 `NewGpuMetricsFromBytes` reads `wire_version` first, decodes the payload with
 the matching struct, and upconverts it to the current shape. **Consumers always
@@ -471,20 +497,28 @@ kubectl apply -f k8s/daemonset.yaml
 ## Updating
 
 On a VM where the exporter was installed from the `.deb`, one command upgrades
-it to the latest GitHub release and restarts the service:
+it to the package served by its host and restarts the service:
 
 ```bash
-sudo gpu-metrics-exporter update      # upgrade to the latest release
-gpu-metrics-exporter update -check    # only report whether a newer one exists (needs no root)
+# The stock .deb units use shared vsock port 9999 (see below).
+sudo GPU_METRICS_EXPORTER_SERVER_PORT=9999 gpu-metrics-exporter update
+GPU_METRICS_EXPORTER_SERVER_PORT=9999 gpu-metrics-exporter update -check  # needs no root
 ```
 
-It asks the GitHub API for the latest release, compares its tag with the
-version dpkg has installed, downloads `gpu-metrics-exporter_<tag>_amd64.deb`
-and installs it with `dpkg -i`. Before installing, it checks that the file is
-the release's asset: fetched over https only (redirects included), with the
-size and sha256 GitHub recorded when it was uploaded. It also checks that the
-package's control file names `gpu-metrics-exporter`, `amd64` and the release's
-own version, so an old package republished under a newer tag is refused.
+The updater connects to host CID 2 on the **same vsock port used for metrics**.
+The receiver distinguishes the versioned update protocol by the first frame's
+magic, so no second listener or update-specific port flag exists. `GET_VERSION`
+returns the host's version, package size and SHA-256. The guest then sends
+`READ(offset, length)` requests and receives up to 60 KiB per response, truncated
+at EOF, until the announced size has been downloaded. There is no HTTP client,
+GitHub API request or network fallback.
+
+Configure the package and its externally supplied version on the receiver as
+described [above](#gpu-metrics-receiver). After download, the guest verifies the
+whole file's size and SHA-256 and uses `dpkg-deb --field` locally to check that
+its control file names `gpu-metrics-exporter`, `amd64` and exactly the announced
+version. Only then does it run `dpkg -i`. Thus a receiver environment version
+that does not match the mounted `.deb` cannot cause an installation.
 
 The service is left as it was, enabled or disabled, running or stopped. If it
 was running, it now runs the new binary. Every release's maintainer scripts
@@ -498,8 +532,8 @@ anyway and stops the service again right after.
 
 | Flag | Effect |
 | --- | --- |
-| `-check` | Report whether a newer release exists; change nothing |
-| `-force` | Install the latest release even when it is not newer than the installed one, when the installed version cannot be compared (a development build), or while the service is stopped |
+| `-check` | Report whether the host has a newer package; change nothing |
+| `-force` | Install the host package even when it is not newer than the installed one, when the installed version cannot be compared (a development build), or while the service is stopped |
 
 `update` refuses to run:
 
@@ -515,19 +549,26 @@ service. Upgrade those once by hand
 (`sudo dpkg -i gpu-metrics-exporter_<tag>_amd64.deb`). From then on, `update`
 works, and [auto-update](#auto-update) is on.
 
-`update` needs https access to `api.github.com`, `github.com` and
-`release-assets.githubusercontent.com`, where downloads redirect. It honours
-`HTTPS_PROXY`, which `sudo` drops by default, so pass it through explicitly:
-`sudo HTTPS_PROXY=http://proxy:3128 gpu-metrics-exporter update`. GitHub allows
-60 unauthenticated API requests an hour per IP address. At one check every
-8 hours, that is about 480 VMs sharing one public address.
+Both the running exporter and `update` read `GPU_METRICS_EXPORTER_SERVER_PORT`,
+then `SERVER_PORT`, with CLI default 1234. The packaged exporter and update
+units both set `GPU_METRICS_EXPORTER_SERVER_PORT=9999`, matching the receiver
+unit. A custom exporter installation should configure the shared environment
+value rather than only overriding the exporter's `-serverPort` flag, so both
+processes continue to use one endpoint. No TCP connectivity, DNS, HTTPS proxy
+or GitHub access is needed by the new updater.
 
-What the checks establish is that the bytes are the release's. They do not
-establish who published the release: anyone who can upload to this
-repository's releases can publish a matching digest. That is the same trust as
-downloading the `.deb` from the release page by hand. The pci-attest signature
-covers the exporter's code pages, not the package or its maintainer scripts,
-and those run as root.
+The frame hashes protect individual responses and SHA-256 checks the complete
+transfer; the control-file checks bind those bytes to the announced version.
+The trust decision is the host operator's choice of `.deb`, not independent
+package provenance. This is not a package signature. The pci-attest signature
+still covers only the exporter's code pages, not the package or its maintainer
+scripts, which run as root.
+
+Exporter versions predating vsock update still use their old GitHub updater.
+If such a guest cannot reach GitHub, install a vsock-capable package once by
+hand. New exporters can update only after the host receiver supports the update
+protocol; until then their automatic checks fail temporarily without changing
+the installation.
 
 ### Auto-update
 
@@ -554,17 +595,21 @@ An automatic update (`gpu-metrics-exporter-update.service`, which runs
 - **It leaves a stopped service alone** instead of refusing. On a Kubernetes
   node whose DaemonSet runs the exporter, the timer therefore does nothing.
 - **A failure before anything was installed exits with status 75**, which the
-  unit counts as success. That covers no route to GitHub, a rate limit, or a
-  download that does not check out. The next check tries again, and a VM
-  without access to GitHub does not show a failed unit three times a day. A
-  failed install does fail the unit.
+  unit counts as success. That covers an unavailable host update service, a
+  protocol/timeout failure, or a download whose size, digest or control file
+  does not check out. The next check tries again, and a VM without a working
+  host update path does not show a failed unit three times a day. A failed
+  install does fail the unit.
 
 Each run's output is in `journalctl -u gpu-metrics-exporter-update`.
 
-Auto-update follows GitHub's *latest* release, so every VM picks up a new
-release within about 9 hours of its publication: publishing a release rolls it
-out. A release published as a prerelease, or not marked as latest, is left
-alone.
+Auto-update follows the package configured on each host, not GitHub's *latest*
+release. Publishing a GitHub Release still produces the signed artifacts but
+does not itself roll them out. To roll out a version, atomically place its
+`.deb` at the configured host path, set `GPU_METRICS_RECEIVER_EXPORTER_VERSION`
+to that release version, and restart the receiver. Each VM with auto-update on
+then picks it up within about 9 hours. The announced version must be a release
+version (`YYYY.MM.DD-N`), not a prerelease or development build.
 
 ## How to build
 ```bash

@@ -4,28 +4,26 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
+	"io"
 	"os"
-	"path"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"go.mws.cloud/gpu-metrics-exporter/pkg/exporterupdate"
+	"go.mws.cloud/gpu-metrics-exporter/pkg/vsock/common"
 	"golang.org/x/sys/unix"
 )
 
 const (
-	testRepo = "owner/repo"
-	oldTag   = "2026.10.06-1"
-	newTag   = "2026.11.20-1"
+	oldTag = "2026.10.06-1"
+	newTag = "2026.11.20-1"
 )
 
 // machine models what the update drives: dpkg's database, the installed
@@ -263,87 +261,56 @@ func pkgFile(pkg, version, arch string) []byte {
 	return []byte(fmt.Sprintf("Package: %s\nVersion: %s\nArchitecture: %s\n", pkg, version, arch))
 }
 
-// fakeGitHub serves the latest-release API and the release's download URLs,
-// which -- as on github.com -- redirect to the asset storage.
-type fakeGitHub struct {
-	tag          string
-	pkg          []byte                  // the exporter .deb's bytes
-	mutate       func(*release, *string) // edits the release before it is served; gets the request host
-	status       int                     // answer the API with this instead
-	header       map[string]string
-	redirectHTTP bool // send the download to plain http
-	apiCalls     atomic.Int32
-	downloads    atomic.Int32
+// fakeHost provides the same package metadata and bytes as the vsock source.
+// Transport corruption is covered by pkg/exporterupdate tests; these tests keep
+// the updater's dpkg/systemd state machine independent of a socket.
+type fakeHost struct {
+	tag         string
+	pkg         []byte
+	size        int64
+	metadataErr error
+	downloadErr error
+	apiCalls    atomic.Int32
+	downloads   atomic.Int32
 }
 
-func (f *fakeGitHub) serve(t *testing.T) *httptest.Server {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/repos/"+testRepo+"/releases/latest", func(w http.ResponseWriter, r *http.Request) {
-		f.apiCalls.Add(1)
-		if !strings.HasPrefix(r.UserAgent(), "gpu-metrics-exporter/") {
-			t.Errorf("User-Agent %q", r.UserAgent())
-		}
-		for k, v := range f.header {
-			w.Header().Set(k, v)
-		}
-		if f.status != 0 {
-			w.WriteHeader(f.status)
-			_, _ = w.Write([]byte(`{"message":"something went wrong"}`))
-			return
-		}
-		sum := sha256.Sum256(f.pkg)
-		receiver := []byte("receiver")
-		rsum := sha256.Sum256(receiver)
-		name := "gpu-metrics-exporter_" + f.tag + "_amd64.deb"
-		rel := release{
-			TagName: f.tag,
-			HTMLURL: "https://" + r.Host + "/" + testRepo + "/releases/tag/" + f.tag,
-			Assets: []asset{{
-				Name: "gpu-metrics-receiver_" + f.tag + "_amd64.deb", State: "uploaded", Size: int64(len(receiver)),
-				Digest:             "sha256:" + hex.EncodeToString(rsum[:]),
-				BrowserDownloadURL: "https://" + r.Host + "/download/gpu-metrics-receiver_" + f.tag + "_amd64.deb",
-			}, {
-				Name: name, State: "uploaded", Size: int64(len(f.pkg)),
-				Digest:             "sha256:" + hex.EncodeToString(sum[:]),
-				BrowserDownloadURL: "https://" + r.Host + "/download/" + name,
-			}},
-		}
-		if f.mutate != nil {
-			f.mutate(&rel, &r.Host)
-		}
-		_ = json.NewEncoder(w).Encode(rel)
-	})
-	mux.HandleFunc("/download/", func(w http.ResponseWriter, r *http.Request) {
-		scheme := "https://"
-		if f.redirectHTTP {
-			scheme = "http://"
-		}
-		http.Redirect(w, r, scheme+r.Host+"/objects/"+path.Base(r.URL.Path), http.StatusFound)
-	})
-	mux.HandleFunc("/objects/", func(w http.ResponseWriter, r *http.Request) {
-		f.downloads.Add(1)
-		if strings.Contains(r.URL.Path, "receiver") {
-			_, _ = w.Write([]byte("receiver"))
-			return
-		}
-		_, _ = w.Write(f.pkg)
-	})
-	srv := httptest.NewTLSServer(mux)
-	t.Cleanup(srv.Close)
-	return srv
+func newFakeHost(tag string) *fakeHost {
+	return &fakeHost{tag: tag, pkg: pkgFile(packageName, tag, "amd64")}
 }
 
-func newGitHub(tag string) *fakeGitHub {
-	return &fakeGitHub{tag: tag, pkg: pkgFile(packageName, tag, "amd64")}
+func (f *fakeHost) GetMetadata(context.Context) (exporterupdate.Metadata, error) {
+	f.apiCalls.Add(1)
+	if f.metadataErr != nil {
+		return exporterupdate.Metadata{}, f.metadataErr
+	}
+	size := f.size
+	if size == 0 {
+		size = int64(len(f.pkg))
+	}
+	return exporterupdate.Metadata{
+		Version: f.tag,
+		Size:    size,
+		SHA256:  sha256.Sum256(f.pkg),
+	}, nil
 }
 
-func newTestUpdater(t *testing.T, m *machine, srv *httptest.Server) (*Updater, *bytes.Buffer) {
+func (f *fakeHost) Download(_ context.Context, _ exporterupdate.Metadata, dst io.Writer) error {
+	f.downloads.Add(1)
+	if f.downloadErr != nil {
+		return f.downloadErr
+	}
+	n, err := dst.Write(f.pkg)
+	if err == nil && n != len(f.pkg) {
+		return io.ErrShortWrite
+	}
+	return err
+}
+
+func newTestUpdater(t *testing.T, m *machine, source *fakeHost) (*Updater, *bytes.Buffer) {
 	out := &bytes.Buffer{}
 	return &Updater{
 		self:              m.pkgVersion,
-		repo:              testRepo,
-		apiBase:           srv.URL,
-		http:              newHTTPClient(srv.Client().Transport),
+		source:            source,
 		cmd:               m,
 		out:               out,
 		geteuid:           func() int { return 0 },
@@ -359,14 +326,14 @@ func newTestUpdater(t *testing.T, m *machine, srv *httptest.Server) (*Updater, *
 
 func TestUpdateInstallsNewerRelease(t *testing.T) {
 	m := newMachine(t, oldTag, true, true)
-	gh := newGitHub(newTag)
-	u, out := newTestUpdater(t, m, gh.serve(t))
+	gh := newFakeHost(newTag)
+	u, out := newTestUpdater(t, m, gh)
 
 	if err := u.Update(context.Background()); err != nil {
 		t.Fatalf("Update: %v\n%s", err, out)
 	}
 	if len(m.installed) != 1 || !bytes.Equal(m.installed[0], gh.pkg) {
-		t.Fatalf("dpkg -i got %q, want the release's package", m.installed)
+		t.Fatalf("dpkg -i got %q, want the host package", m.installed)
 	}
 	if m.pkgVersion != newTag {
 		t.Errorf("installed version %q, want %s", m.pkgVersion, newTag)
@@ -391,7 +358,7 @@ func TestUpdateInstallsNewerRelease(t *testing.T) {
 func TestUpdateRestartsServiceLeftOnOldBinary(t *testing.T) {
 	m := newMachine(t, oldTag, true, true)
 	m.keepServiceOnUpgrade = true
-	u, out := newTestUpdater(t, m, newGitHub(newTag).serve(t))
+	u, out := newTestUpdater(t, m, newFakeHost(newTag))
 
 	if err := u.Update(context.Background()); err != nil {
 		t.Fatalf("Update: %v\n%s", err, out)
@@ -422,8 +389,8 @@ func TestUpdateKeepsServiceAsItWas(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			m := newMachine(t, oldTag, tc.enabled, tc.running)
 			before := m.unit
-			gh := newGitHub(newTag)
-			u, out := newTestUpdater(t, m, gh.serve(t))
+			gh := newFakeHost(newTag)
+			u, out := newTestUpdater(t, m, gh)
 			u.Force = tc.force
 
 			err := u.Update(context.Background())
@@ -456,13 +423,13 @@ func TestUpdateKeepsServiceAsItWas(t *testing.T) {
 func TestUpdateNothingToDo(t *testing.T) {
 	for _, tc := range []struct{ name, installed, want string }{
 		{"up to date", newTag, "already up to date"},
-		{"built past the latest release", newTag + "-4-gabc1234", "newer than the latest release"},
-		{"a later release than the latest", "2026.12.01-1", "newer than the latest release"},
+		{"built past the latest release", newTag + "-4-gabc1234", "newer than the host package"},
+		{"a later release than the latest", "2026.12.01-1", "newer than the host package"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m := newMachine(t, tc.installed, true, true)
-			gh := newGitHub(newTag)
-			u, out := newTestUpdater(t, m, gh.serve(t))
+			gh := newFakeHost(newTag)
+			u, out := newTestUpdater(t, m, gh)
 			if err := u.Update(context.Background()); err != nil {
 				t.Fatalf("Update: %v\n%s", err, out)
 			}
@@ -478,7 +445,7 @@ func TestUpdateNothingToDo(t *testing.T) {
 
 func TestUpdateForceReinstalls(t *testing.T) {
 	m := newMachine(t, newTag, true, true)
-	u, out := newTestUpdater(t, m, newGitHub(newTag).serve(t))
+	u, out := newTestUpdater(t, m, newFakeHost(newTag))
 	u.Force = true
 	if err := u.Update(context.Background()); err != nil {
 		t.Fatalf("Update: %v\n%s", err, out)
@@ -490,7 +457,7 @@ func TestUpdateForceReinstalls(t *testing.T) {
 
 func TestUpdateFromBuildPastAnOlderTag(t *testing.T) {
 	m := newMachine(t, oldTag+"-3-gabc1234", true, true)
-	u, out := newTestUpdater(t, m, newGitHub(newTag).serve(t))
+	u, out := newTestUpdater(t, m, newFakeHost(newTag))
 	if err := u.Update(context.Background()); err != nil {
 		t.Fatalf("Update: %v\n%s", err, out)
 	}
@@ -501,8 +468,8 @@ func TestUpdateFromBuildPastAnOlderTag(t *testing.T) {
 
 func TestUpdateIncomparableVersionNeedsForce(t *testing.T) {
 	m := newMachine(t, "0.0.0-dev", true, true) // build-deb.sh's fallback
-	gh := newGitHub(newTag)
-	u, out := newTestUpdater(t, m, gh.serve(t))
+	gh := newFakeHost(newTag)
+	u, out := newTestUpdater(t, m, gh)
 	if err := u.Update(context.Background()); err == nil || !strings.Contains(err.Error(), "-force") {
 		t.Fatalf("Update: %v, want a refusal pointing at -force\n%s", err, out)
 	}
@@ -518,69 +485,33 @@ func TestUpdateIncomparableVersionNeedsForce(t *testing.T) {
 	}
 }
 
-// Every way the release can fail to be the package it claims must stop the
-// update before dpkg sees the file.
-func TestUpdateRejectsBadRelease(t *testing.T) {
-	exporterAsset := func(rel *release) *asset { return &rel.Assets[1] }
+// Host metadata and control-file mismatches must stop the update before dpkg.
+func TestUpdateRejectsBadHostPackage(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
-		setup func(*fakeGitHub)
+		setup func(*fakeHost)
 		want  string
 	}{
-		{"digest mismatch", func(f *fakeGitHub) {
-			f.mutate = func(rel *release, _ *string) {
-				sum := sha256.Sum256([]byte("something else"))
-				exporterAsset(rel).Digest = "sha256:" + hex.EncodeToString(sum[:])
-			}
-		}, "does not match"},
-		{"no digest", func(f *fakeGitHub) {
-			f.mutate = func(rel *release, _ *string) { exporterAsset(rel).Digest = "" }
-		}, "no sha256 digest"},
-		{"another digest algorithm", func(f *fakeGitHub) {
-			f.mutate = func(rel *release, _ *string) {
-				exporterAsset(rel).Digest = "sha1:0123456789abcdef0123456789abcdef01234567"
-			}
-		}, "no sha256 digest"},
-		{"shorter than listed", func(f *fakeGitHub) {
-			f.mutate = func(rel *release, _ *string) { exporterAsset(rel).Size += 10 }
-		}, "GitHub lists"},
-		{"longer than listed", func(f *fakeGitHub) {
-			f.mutate = func(rel *release, _ *string) { exporterAsset(rel).Size-- }
-		}, "GitHub lists"},
-		{"implausible size", func(f *fakeGitHub) {
-			f.mutate = func(rel *release, _ *string) { exporterAsset(rel).Size = maxPackageSize + 1 }
-		}, "implausible size"},
-		{"http download URL", func(f *fakeGitHub) {
-			f.mutate = func(rel *release, host *string) {
-				exporterAsset(rel).BrowserDownloadURL = "http://" + *host + "/objects/" + exporterAsset(rel).Name
-			}
-		}, "not an https URL"},
-		{"redirect to http", func(f *fakeGitHub) { f.redirectHTTP = true }, "not https"},
-		{"no exporter package", func(f *fakeGitHub) {
-			f.mutate = func(rel *release, _ *string) { rel.Assets = rel.Assets[:1] }
-		}, "has no gpu-metrics-exporter_" + newTag + "_amd64.deb"},
-		{"upload unfinished", func(f *fakeGitHub) {
-			f.mutate = func(rel *release, _ *string) { exporterAsset(rel).State = "open" }
-		}, "not uploaded"},
-		{"draft", func(f *fakeGitHub) {
-			f.mutate = func(rel *release, _ *string) { rel.Draft = true }
-		}, "draft"},
-		{"tag is not a release version", func(f *fakeGitHub) {
+		{"implausible size", func(f *fakeHost) {
+			f.size = exporterupdate.MaxPackageSize + 1
+		}, "invalid size"},
+		{"host version is not a release", func(f *fakeHost) {
 			f.tag = newTag + "-1-gabc1234"
 			f.pkg = pkgFile(packageName, f.tag, "amd64")
 		}, "not a release version"},
-		// An old, genuine package republished under a newer tag: its digest
-		// matches, its control file gives it away.
-		{"package of another version", func(f *fakeGitHub) { f.pkg = pkgFile(packageName, oldTag, "amd64") }, "Version"},
-		{"another package", func(f *fakeGitHub) { f.pkg = pkgFile("gpu-metrics-receiver", newTag, "amd64") }, "Package"},
-		{"another architecture", func(f *fakeGitHub) { f.pkg = pkgFile(packageName, newTag, "arm64") }, "Architecture"},
+		{"transfer failed", func(f *fakeHost) {
+			f.downloadErr = errors.New("vsock transfer broke")
+		}, "vsock transfer broke"},
+		{"package of another version", func(f *fakeHost) { f.pkg = pkgFile(packageName, oldTag, "amd64") }, "Version"},
+		{"another package", func(f *fakeHost) { f.pkg = pkgFile("gpu-metrics-receiver", newTag, "amd64") }, "Package"},
+		{"another architecture", func(f *fakeHost) { f.pkg = pkgFile(packageName, newTag, "arm64") }, "Architecture"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m := newMachine(t, oldTag, true, true)
 			before := m.unit
-			gh := newGitHub(newTag)
+			gh := newFakeHost(newTag)
 			tc.setup(gh)
-			u, out := newTestUpdater(t, m, gh.serve(t))
+			u, out := newTestUpdater(t, m, gh)
 
 			err := u.Update(context.Background())
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
@@ -616,8 +547,8 @@ func TestUpdateRefusesKubernetesPod(t *testing.T) {
 		for _, check := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s, check %v", tc.name, check), func(t *testing.T) {
 				m := newMachine(t, oldTag, true, true)
-				gh := newGitHub(newTag)
-				u, out := newTestUpdater(t, m, gh.serve(t))
+				gh := newFakeHost(newTag)
+				u, out := newTestUpdater(t, m, gh)
 				u.CheckOnly = check
 				tc.setup(t, u)
 
@@ -626,7 +557,7 @@ func TestUpdateRefusesKubernetesPod(t *testing.T) {
 					t.Fatalf("Update: %v, want a refusal pointing at the DaemonSet\n%s", err, out)
 				}
 				if gh.apiCalls.Load() != 0 || len(m.calls) != 0 {
-					t.Errorf("refused, yet queried GitHub %d times and ran %q", gh.apiCalls.Load(), m.calls)
+					t.Errorf("refused, yet contacted host %d times and ran %q", gh.apiCalls.Load(), m.calls)
 				}
 			})
 		}
@@ -644,14 +575,14 @@ func TestUpdateNeedsRootAndSystemd(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m := newMachine(t, oldTag, true, true)
-			gh := newGitHub(newTag)
-			u, out := newTestUpdater(t, m, gh.serve(t))
+			gh := newFakeHost(newTag)
+			u, out := newTestUpdater(t, m, gh)
 			tc.setup(t, u)
 			if err := u.Update(context.Background()); err == nil || !strings.Contains(err.Error(), tc.want) {
 				t.Fatalf("Update: %v, want an error mentioning %q\n%s", err, tc.want, out)
 			}
 			if gh.apiCalls.Load() != 0 || len(m.calls) != 0 {
-				t.Errorf("refused, yet queried GitHub %d times and ran %q", gh.apiCalls.Load(), m.calls)
+				t.Errorf("refused, yet contacted host %d times and ran %q", gh.apiCalls.Load(), m.calls)
 			}
 		})
 	}
@@ -662,13 +593,13 @@ func TestUpdateNeedsInstalledPackage(t *testing.T) {
 		t.Run(fmt.Sprintf("status %q", status), func(t *testing.T) {
 			m := newMachine(t, oldTag, true, true)
 			m.pkgStatus = status
-			gh := newGitHub(newTag)
-			u, out := newTestUpdater(t, m, gh.serve(t))
-			if err := u.Update(context.Background()); err == nil || !strings.Contains(err.Error(), "Install the .deb") {
+			gh := newFakeHost(newTag)
+			u, out := newTestUpdater(t, m, gh)
+			if err := u.Update(context.Background()); err == nil || !strings.Contains(err.Error(), "Install the initial .deb") {
 				t.Fatalf("Update: %v, want a refusal\n%s", err, out)
 			}
 			if gh.apiCalls.Load() != 0 || len(m.installed) != 0 {
-				t.Errorf("refused, yet queried GitHub %d times, installed %d", gh.apiCalls.Load(), len(m.installed))
+				t.Errorf("refused, yet contacted host %d times, installed %d", gh.apiCalls.Load(), len(m.installed))
 			}
 		})
 	}
@@ -677,8 +608,8 @@ func TestUpdateNeedsInstalledPackage(t *testing.T) {
 func TestUpdateCheckOnly(t *testing.T) {
 	t.Run("installed package", func(t *testing.T) {
 		m := newMachine(t, oldTag, true, true)
-		gh := newGitHub(newTag)
-		u, out := newTestUpdater(t, m, gh.serve(t))
+		gh := newFakeHost(newTag)
+		u, out := newTestUpdater(t, m, gh)
 		u.CheckOnly = true
 		u.geteuid = func() int { return 1000 } // needs no root
 		if err := u.Update(context.Background()); err != nil {
@@ -694,7 +625,7 @@ func TestUpdateCheckOnly(t *testing.T) {
 	t.Run("no package: compares this binary", func(t *testing.T) {
 		m := newMachine(t, oldTag, true, true)
 		m.pkgStatus = ""
-		u, out := newTestUpdater(t, m, newGitHub(newTag).serve(t))
+		u, out := newTestUpdater(t, m, newFakeHost(newTag))
 		u.CheckOnly = true
 		u.self = oldTag + "-2-gabc1234"
 		if err := u.Update(context.Background()); err != nil {
@@ -706,42 +637,24 @@ func TestUpdateCheckOnly(t *testing.T) {
 	})
 }
 
-func TestUpdateReportsGitHubErrors(t *testing.T) {
-	for _, tc := range []struct {
-		name   string
-		status int
-		header map[string]string
-		want   []string
-	}{
-		{"rate limited", http.StatusForbidden,
-			map[string]string{"X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "1790000000"},
-			[]string{"rate limit", "resets at 2026-09-21T"}},
-		{"forbidden", http.StatusForbidden, nil, []string{"403", "something went wrong"}},
-		{"no release", http.StatusNotFound, nil, []string{"has no published release"}},
-		{"server error", http.StatusBadGateway, nil, []string{"502"}},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			m := newMachine(t, oldTag, true, true)
-			gh := newGitHub(newTag)
-			gh.status, gh.header = tc.status, tc.header
-			u, out := newTestUpdater(t, m, gh.serve(t))
-			err := u.Update(context.Background())
-			if err == nil {
-				t.Fatalf("Update succeeded\n%s", out)
-			}
-			for _, want := range tc.want {
-				if !strings.Contains(err.Error(), want) {
-					t.Errorf("error %q lacks %q", err, want)
-				}
-			}
-		})
+func TestUpdateReportsHostErrors(t *testing.T) {
+	m := newMachine(t, oldTag, true, true)
+	gh := newFakeHost(newTag)
+	gh.metadataErr = errors.New("host update service unavailable")
+	u, out := newTestUpdater(t, m, gh)
+	err := u.Update(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "host update service unavailable") {
+		t.Fatalf("Update error %v\n%s", err, out)
+	}
+	if gh.downloads.Load() != 0 || len(m.installed) != 0 {
+		t.Fatalf("metadata failed, yet downloaded %d and installed %d", gh.downloads.Load(), len(m.installed))
 	}
 }
 
 func TestUpdateDpkgFailure(t *testing.T) {
 	m := newMachine(t, oldTag, true, true)
 	m.dpkgErr = errors.New("dpkg -i: exit status 1")
-	u, out := newTestUpdater(t, m, newGitHub(newTag).serve(t))
+	u, out := newTestUpdater(t, m, newFakeHost(newTag))
 	err := u.Update(context.Background())
 	if err == nil || !strings.Contains(err.Error(), "dpkg --audit") {
 		t.Fatalf("Update: %v, want the dpkg failure\n%s", err, out)
@@ -777,7 +690,7 @@ func TestUpdateFailuresAfterDpkgAreInstallErrors(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			m := newMachine(t, oldTag, true, true)
 			tc.setup(m)
-			u, out := newTestUpdater(t, m, newGitHub(newTag).serve(t))
+			u, out := newTestUpdater(t, m, newFakeHost(newTag))
 			u.Auto = true
 			err := u.Update(context.Background())
 			if err == nil || !strings.Contains(err.Error(), tc.want) {
@@ -793,7 +706,7 @@ func TestUpdateFailuresAfterDpkgAreInstallErrors(t *testing.T) {
 
 func TestAutoUpdateStatusRefusesKubernetesPod(t *testing.T) {
 	m := newMachine(t, newTag, true, true)
-	u, out := newTestUpdater(t, m, newGitHub(newTag).serve(t))
+	u, out := newTestUpdater(t, m, newFakeHost(newTag))
 	u.getenv = func(k string) string {
 		if k == "KUBERNETES_SERVICE_HOST" {
 			return "10.96.0.1"
@@ -813,20 +726,18 @@ func TestAutoUpdateStatusRefusesKubernetesPod(t *testing.T) {
 func TestUpdateFailuresBeforeDpkgAreNotInstallErrors(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
-		setup func(*machine, *fakeGitHub)
+		setup func(*machine, *fakeHost)
 	}{
-		{"GitHub unreachable", func(_ *machine, f *fakeGitHub) { f.status = http.StatusBadGateway }},
-		{"digest mismatch", func(_ *machine, f *fakeGitHub) {
-			f.mutate = func(rel *release, _ *string) { rel.Assets[1].Digest = "sha256:" + strings.Repeat("00", 32) }
-		}},
-		{"package of another version", func(_ *machine, f *fakeGitHub) { f.pkg = pkgFile(packageName, oldTag, "amd64") }},
-		{"no package installed", func(m *machine, _ *fakeGitHub) { m.pkgStatus = "" }},
+		{"host unreachable", func(_ *machine, f *fakeHost) { f.metadataErr = errors.New("host unreachable") }},
+		{"transfer failed", func(_ *machine, f *fakeHost) { f.downloadErr = errors.New("transfer failed") }},
+		{"package of another version", func(_ *machine, f *fakeHost) { f.pkg = pkgFile(packageName, oldTag, "amd64") }},
+		{"no package installed", func(m *machine, _ *fakeHost) { m.pkgStatus = "" }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m := newMachine(t, oldTag, true, true)
-			gh := newGitHub(newTag)
+			gh := newFakeHost(newTag)
 			tc.setup(m, gh)
-			u, out := newTestUpdater(t, m, gh.serve(t))
+			u, out := newTestUpdater(t, m, gh)
 			u.Auto = true
 			err := u.Update(context.Background())
 			if err == nil {
@@ -843,8 +754,8 @@ func TestUpdateFailuresBeforeDpkgAreNotInstallErrors(t *testing.T) {
 func TestUpdateAutoLeavesStoppedServiceAlone(t *testing.T) {
 	m := newMachine(t, oldTag, false, false) // a Kubernetes node: the DaemonSet runs the exporter
 	before := m.unit
-	gh := newGitHub(newTag)
-	u, out := newTestUpdater(t, m, gh.serve(t))
+	gh := newFakeHost(newTag)
+	u, out := newTestUpdater(t, m, gh)
 	u.Auto = true
 	if err := u.Update(context.Background()); err != nil {
 		t.Fatalf("Update: %v, want a quiet skip\n%s", err, out)
@@ -859,7 +770,7 @@ func TestUpdateAutoLeavesStoppedServiceAlone(t *testing.T) {
 
 func TestUpdateAutoInstallsLikeUpdate(t *testing.T) {
 	m := newMachine(t, oldTag, true, true)
-	u, out := newTestUpdater(t, m, newGitHub(newTag).serve(t))
+	u, out := newTestUpdater(t, m, newFakeHost(newTag))
 	u.Auto = true
 	if err := u.Update(context.Background()); err != nil {
 		t.Fatalf("Update: %v\n%s", err, out)
@@ -875,15 +786,15 @@ func TestUpdateAutoTakesNoForceOrCheck(t *testing.T) {
 		func(u *Updater) { u.CheckOnly = true },
 	} {
 		m := newMachine(t, oldTag, false, false)
-		gh := newGitHub(newTag)
-		u, out := newTestUpdater(t, m, gh.serve(t))
+		gh := newFakeHost(newTag)
+		u, out := newTestUpdater(t, m, gh)
 		u.Auto = true
 		set(u)
 		if err := u.Update(context.Background()); err == nil {
 			t.Fatalf("Update succeeded\n%s", out)
 		}
 		if gh.apiCalls.Load() != 0 || len(m.calls) != 0 {
-			t.Errorf("refused, yet queried GitHub %d times and ran %q", gh.apiCalls.Load(), m.calls)
+			t.Errorf("refused, yet contacted host %d times and ran %q", gh.apiCalls.Load(), m.calls)
 		}
 	}
 }
@@ -891,8 +802,8 @@ func TestUpdateAutoTakesNoForceOrCheck(t *testing.T) {
 // A manual update and the timer's must not run at once.
 func TestUpdateHoldsTheLock(t *testing.T) {
 	m := newMachine(t, oldTag, true, true)
-	gh := newGitHub(newTag)
-	u, out := newTestUpdater(t, m, gh.serve(t))
+	gh := newFakeHost(newTag)
+	u, out := newTestUpdater(t, m, gh)
 
 	// Another update holds the lock: a second open file, as another process has.
 	f, err := os.OpenFile(u.lockPath, os.O_RDWR|os.O_CREATE, 0o600)
@@ -906,7 +817,7 @@ func TestUpdateHoldsTheLock(t *testing.T) {
 		t.Fatalf("Update: %v, want it locked out\n%s", err, out)
 	}
 	if gh.apiCalls.Load() != 0 || len(m.calls) != 0 {
-		t.Errorf("locked out, yet queried GitHub %d times and ran %q", gh.apiCalls.Load(), m.calls)
+		t.Errorf("locked out, yet contacted host %d times and ran %q", gh.apiCalls.Load(), m.calls)
 	}
 
 	// Checking changes nothing, so it does not wait for the lock.
@@ -928,7 +839,7 @@ func TestUpdateHoldsTheLock(t *testing.T) {
 
 func TestSetAutoUpdate(t *testing.T) {
 	m := newMachine(t, newTag, true, true)
-	u, out := newTestUpdater(t, m, newGitHub(newTag).serve(t))
+	u, out := newTestUpdater(t, m, newFakeHost(newTag))
 
 	if err := u.SetAutoUpdate(false); err != nil {
 		t.Fatalf("SetAutoUpdate(false): %v\n%s", err, out)
@@ -981,7 +892,7 @@ func TestSetAutoUpdateRefuses(t *testing.T) {
 		for _, enable := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s, enable %v", tc.name, enable), func(t *testing.T) {
 				m := newMachine(t, newTag, true, true)
-				u, out := newTestUpdater(t, m, newGitHub(newTag).serve(t))
+				u, out := newTestUpdater(t, m, newFakeHost(newTag))
 				tc.setup(t, m, u)
 				err := u.SetAutoUpdate(enable)
 				if err == nil || !strings.Contains(err.Error(), tc.want) {
@@ -1031,7 +942,7 @@ func TestAutoUpdateStatus(t *testing.T) {
 			if tc.lastCheck != nil {
 				m.lastCheck = tc.lastCheck
 			}
-			u, out := newTestUpdater(t, m, newGitHub(newTag).serve(t))
+			u, out := newTestUpdater(t, m, newFakeHost(newTag))
 			u.geteuid = func() int { return 1000 } // needs no root
 			if err := u.AutoUpdateStatus(); err != nil {
 				t.Fatalf("AutoUpdateStatus: %v\n%s", err, out)
@@ -1057,7 +968,7 @@ func TestAutoUpdateStatusWithoutDBus(t *testing.T) {
 	}{{1000, true}, {0, false}} {
 		m := newMachine(t, newTag, true, true)
 		m.showErr = errors.New("systemctl show: exit status 1: Failed to connect to bus: No such file or directory")
-		u, _ := newTestUpdater(t, m, newGitHub(newTag).serve(t))
+		u, _ := newTestUpdater(t, m, newFakeHost(newTag))
 		u.geteuid = func() int { return tc.euid }
 		err := u.AutoUpdateStatus()
 		if err == nil {
@@ -1066,5 +977,61 @@ func TestAutoUpdateStatusWithoutDBus(t *testing.T) {
 		if got := strings.Contains(err.Error(), "try it with sudo"); got != tc.wantHint {
 			t.Errorf("euid %d: %q; want the sudo hint: %v", tc.euid, err, tc.wantHint)
 		}
+	}
+}
+
+func TestUpdateOverRealUpdateProtocol(t *testing.T) {
+	m := newMachine(t, oldTag, true, true)
+	u, out := newTestUpdater(t, m, newFakeHost(newTag))
+	pkgBytes := pkgFile(packageName, newTag, "amd64")
+	path := filepath.Join(t.TempDir(), "exporter.deb")
+	if err := os.WriteFile(path, pkgBytes, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pkg, err := exporterupdate.OpenPackage(path, newTag)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = pkg.Close() })
+	server := &exporterupdate.Server{Package: pkg}
+	u.source = exporterupdate.NewClientWithDial(func() (*common.VsockConn, error) {
+		fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+		if err != nil {
+			return nil, err
+		}
+		clientConn := common.NewVsockConn(fds[0])
+		serverConn := common.NewVsockConn(fds[1])
+		done := make(chan error, 1)
+		go func() {
+			defer func() { _ = serverConn.Close() }()
+			first, err := serverConn.RecvData()
+			if err != nil {
+				done <- err
+				return
+			}
+			done <- server.Serve(serverConn, first, 2*time.Second, 2*time.Second)
+		}()
+		t.Cleanup(func() {
+			_ = clientConn.Close()
+			select {
+			case err := <-done:
+				if err != nil {
+					t.Errorf("real update protocol server: %v", err)
+				}
+			case <-time.After(2 * time.Second):
+				t.Errorf("real update protocol server did not stop")
+			}
+		})
+		return clientConn, nil
+	})
+
+	if err := u.Update(context.Background()); err != nil {
+		t.Fatalf("Update over real protocol: %v\n%s", err, out)
+	}
+	if len(m.installed) != 1 || !bytes.Equal(m.installed[0], pkgBytes) {
+		t.Fatalf("dpkg installed %q, want host package bytes", m.installed)
+	}
+	if m.pkgVersion != newTag || !m.runsNewBinary() {
+		t.Fatalf("installed %s, running new binary %v", m.pkgVersion, m.runsNewBinary())
 	}
 }

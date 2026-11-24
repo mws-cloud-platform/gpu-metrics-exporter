@@ -1,8 +1,8 @@
 // Package selfupdate implements `gpu-metrics-exporter update` and
 // `gpu-metrics-exporter auto-update`: upgrade the installed
-// gpu-metrics-exporter package on a VM to the latest GitHub release -- by
-// hand, or from the systemd timer auto-update enables -- and put its service
-// back the way it was.
+// gpu-metrics-exporter package on a VM to the version served by its host over
+// the existing metrics vsock port -- by hand, or from the systemd timer
+// auto-update enables -- and put its service back the way it was.
 //
 // It refuses to run in a Kubernetes pod: there the exporter comes from the
 // DaemonSet's image, which the cluster admin rolls out.
@@ -13,20 +13,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
 	"os"
+	"path/filepath"
 
+	"go.mws.cloud/gpu-metrics-exporter/pkg/exporterupdate"
 	"golang.org/x/sys/unix"
 )
 
 const (
-	DefaultRepo    = "mws-cloud-platform/gpu-metrics-exporter"
-	DefaultAPIBase = "https://api.github.com"
-
 	// ExitTempFail (EX_TEMPFAIL) is what `update -auto` exits with when it
 	// failed before installing anything: the next run tries again. The update
-	// unit counts it as success (SuccessExitStatus=75), so a VM that cannot
-	// reach GitHub does not show a failed unit three times a day.
+	// unit counts it as success (SuccessExitStatus=75), so a VM whose host
+	// update service is unavailable does not show a failed unit three times a day.
 	ExitTempFail = 75
 
 	packageName = "gpu-metrics-exporter"
@@ -52,11 +50,16 @@ type InstallError struct{ Err error }
 func (e *InstallError) Error() string { return e.Err.Error() }
 func (e *InstallError) Unwrap() error { return e.Err }
 
-// Updater upgrades the installed package to the latest release.
+type packageSource interface {
+	GetMetadata(context.Context) (exporterupdate.Metadata, error)
+	Download(context.Context, exporterupdate.Metadata, io.Writer) error
+}
+
+// Updater upgrades the installed package to the version served by the host.
 type Updater struct {
-	// CheckOnly reports whether a newer release exists and changes nothing.
+	// CheckOnly reports whether the host has a newer package and changes nothing.
 	CheckOnly bool
-	// Force installs the latest release even when it is not newer than the
+	// Force installs the host package even when it is not newer than the
 	// installed version, or when the installed version cannot be compared,
 	// and even while the service is stopped (it is left stopped).
 	Force bool
@@ -65,9 +68,7 @@ type Updater struct {
 	Auto bool
 
 	self    string // this binary's version, for -check without the package
-	repo    string
-	apiBase string
-	http    *http.Client
+	source  packageSource
 	cmd     commander
 	out     io.Writer
 	geteuid func() int
@@ -82,13 +83,11 @@ type Updater struct {
 }
 
 // New returns an Updater for this machine. selfVersion is the running
-// binary's version.
-func New(selfVersion string) *Updater {
+// binary's version. serverPort is the existing host metrics/update vsock port.
+func New(selfVersion string, serverPort int) *Updater {
 	return &Updater{
 		self:              selfVersion,
-		repo:              DefaultRepo,
-		apiBase:           DefaultAPIBase,
-		http:              newHTTPClient(http.DefaultTransport),
+		source:            exporterupdate.NewClient(nil, serverPort),
 		cmd:               execCommander{stdin: os.Stdin, stdout: os.Stdout, stderr: os.Stderr},
 		out:               os.Stdout,
 		geteuid:           os.Geteuid,
@@ -101,7 +100,7 @@ func New(selfVersion string) *Updater {
 	}
 }
 
-// Update checks for a newer release and, unless CheckOnly, installs it.
+// Update checks the host for a newer package and, unless CheckOnly, installs it.
 func (u *Updater) Update(ctx context.Context) error {
 	if u.inKubernetes() {
 		return errKubernetes
@@ -129,33 +128,36 @@ func (u *Updater) Update(ctx context.Context) error {
 		u.printf("the %s package is not installed (%v); this binary is %s\n", packageName, err, displayVersion(current))
 	default:
 		return fmt.Errorf("update upgrades an installed %s package, and there is none: %w. "+
-			"Install the .deb from https://github.com/%s/releases first", packageName, err, u.repo)
+			"Install the initial .deb by hand first", packageName, err)
 	}
 
-	rel, err := u.latestRelease(ctx)
+	candidate, err := u.source.GetMetadata(ctx)
 	if err != nil {
 		return err
 	}
-	latest, err := ParseVersion(rel.TagName)
-	if err != nil || !latest.IsRelease() {
-		return fmt.Errorf("the latest release's tag %q is not a release version (YYYY.MM.DD-N)", rel.TagName)
+	if candidate.Size <= 0 || candidate.Size > exporterupdate.MaxPackageSize {
+		return fmt.Errorf("host package has invalid size %d", candidate.Size)
 	}
-	u.printf("latest release: %s %s\n", rel.TagName, rel.HTMLURL)
+	latest, err := ParseVersion(candidate.Version)
+	if err != nil || !latest.IsRelease() {
+		return fmt.Errorf("the host package version %q is not a release version (YYYY.MM.DD-N)", candidate.Version)
+	}
+	u.printf("host package: %s (%d bytes)\n", candidate.Version, candidate.Size)
 
 	newer := false
 	switch cur, err := ParseVersion(current); {
 	case err != nil:
-		u.printf("cannot tell whether %s is newer than %s\n", rel.TagName, displayVersion(current))
+		u.printf("cannot tell whether %s is newer than %s\n", candidate.Version, displayVersion(current))
 		if !u.CheckOnly && !u.Force {
 			return errors.New("pass -force to install it anyway")
 		}
 	case latest.Compare(cur) > 0:
 		newer = true
-		u.printf("update available: %s -> %s\n", current, rel.TagName)
+		u.printf("update available: %s -> %s\n", current, candidate.Version)
 	case latest.Compare(cur) == 0:
 		u.printf("already up to date\n")
 	default:
-		u.printf("the installed version is newer than the latest release\n")
+		u.printf("the installed version is newer than the host package\n")
 	}
 	if u.CheckOnly || (!newer && !u.Force) {
 		return nil
@@ -178,32 +180,28 @@ func (u *Updater) Update(ctx context.Context) error {
 		}
 	}
 
-	name := fmt.Sprintf("%s_%s_%s.deb", packageName, rel.TagName, packageArch)
-	var pkg *asset
-	for i := range rel.Assets {
-		if rel.Assets[i].Name == name {
-			pkg = &rel.Assets[i]
-		}
-	}
-	if pkg == nil {
-		return fmt.Errorf("release %s has no %s", rel.TagName, name)
-	}
-	if pkg.State != "" && pkg.State != "uploaded" {
-		return fmt.Errorf("release %s: %s is still %q, not uploaded", rel.TagName, name, pkg.State)
-	}
-
+	name := fmt.Sprintf("%s_%s_%s.deb", packageName, candidate.Version, packageArch)
 	dir, err := os.MkdirTemp(u.tempDir, "gpu-metrics-exporter-update-")
 	if err != nil {
 		return err
 	}
 	defer func() { _ = os.RemoveAll(dir) }()
-	u.printf("downloading %s (%.1f MiB)\n", name, float64(pkg.Size)/(1<<20))
-	path, err := u.download(ctx, *pkg, dir, name)
+	u.printf("downloading %s from host (%.1f MiB)\n", name, float64(candidate.Size)/(1<<20))
+	path := filepath.Join(dir, name)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return err
 	}
-	u.printf("size and %s match what GitHub recorded for the asset\n", pkg.Digest)
-	if err := u.checkPackage(path, rel.TagName); err != nil {
+	downloadErr := u.source.Download(ctx, candidate, f)
+	closeErr := f.Close()
+	if downloadErr != nil {
+		return downloadErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	u.printf("size and sha256 match the host package metadata\n")
+	if err := u.checkPackage(path, candidate.Version); err != nil {
 		return err
 	}
 	if err := ctx.Err(); err != nil {
@@ -216,16 +214,16 @@ func (u *Updater) Update(ctx context.Context) error {
 		return &InstallError{fmt.Errorf("%w; see `dpkg --audit` and `systemctl status %s`", err, serviceName)}
 	}
 	if err := u.restoreService(before); err != nil {
-		return &InstallError{fmt.Errorf("%s is installed, but putting the service back failed: %w", rel.TagName, err)}
+		return &InstallError{fmt.Errorf("%s is installed, but putting the service back failed: %w", candidate.Version, err)}
 	}
-	if got, err := u.installedVersion(); err != nil || got != rel.TagName {
-		return &InstallError{fmt.Errorf("dpkg -i succeeded, yet dpkg reports %q installed (%v), not %s", got, err, rel.TagName)}
+	if got, err := u.installedVersion(); err != nil || got != candidate.Version {
+		return &InstallError{fmt.Errorf("dpkg -i succeeded, yet dpkg reports %q installed (%v), not %s", got, err, candidate.Version)}
 	}
 	after, err := u.unitState(serviceName)
 	if err != nil {
 		return &InstallError{err}
 	}
-	u.printf("updated %s -> %s; %s: %s\n", current, rel.TagName, serviceName, after)
+	u.printf("updated %s -> %s; %s: %s\n", current, candidate.Version, serviceName, after)
 	return nil
 }
 
@@ -270,8 +268,6 @@ func (u *Updater) lock() (unlock func(), err error) {
 	}
 	return func() { _ = f.Close() }, nil
 }
-
-func (u *Updater) userAgent() string { return "gpu-metrics-exporter/" + displayVersion(u.self) }
 
 func (u *Updater) printf(format string, args ...any) { _, _ = fmt.Fprintf(u.out, format, args...) }
 

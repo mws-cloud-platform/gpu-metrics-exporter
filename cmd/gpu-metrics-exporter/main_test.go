@@ -11,7 +11,7 @@ import (
 // Only an automatic run that changed nothing may exit ExitTempFail, which the
 // update unit counts as success; a failed install must fail the unit.
 func TestUpdateExitCode(t *testing.T) {
-	checkFailed := errors.New("query the latest release: GitHub API: 502 Bad Gateway")
+	checkFailed := errors.New("host update service unavailable")
 	installFailed := fmt.Errorf("wrapped: %w", &selfupdate.InstallError{Err: errors.New("dpkg -i: exit status 1")})
 	for _, tc := range []struct {
 		err  error
@@ -81,5 +81,25 @@ func TestGetEnvInt(t *testing.T) {
 	t.Setenv(primary, "invalid_num")
 	if _, err := getEnvInt(primary, fallback, 1234); err == nil {
 		t.Fatal("expected error for invalid number, got nil")
+	}
+}
+
+func TestDefaultServerPortIsShared(t *testing.T) {
+	t.Setenv("GPU_METRICS_EXPORTER_SERVER_PORT", "")
+	t.Setenv("SERVER_PORT", "")
+	if got, err := defaultServerPort(); err != nil || got != 1234 {
+		t.Fatalf("defaultServerPort default = %d, %v", got, err)
+	}
+	t.Setenv("SERVER_PORT", "9999")
+	if got, err := defaultServerPort(); err != nil || got != 9999 {
+		t.Fatalf("defaultServerPort fallback = %d, %v", got, err)
+	}
+	t.Setenv("GPU_METRICS_EXPORTER_SERVER_PORT", "10000")
+	if got, err := defaultServerPort(); err != nil || got != 10000 {
+		t.Fatalf("defaultServerPort primary = %d, %v", got, err)
+	}
+	t.Setenv("GPU_METRICS_EXPORTER_SERVER_PORT", "invalid")
+	if _, err := defaultServerPort(); err == nil {
+		t.Fatal("defaultServerPort accepted invalid shared port")
 	}
 }

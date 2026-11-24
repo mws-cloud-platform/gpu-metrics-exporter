@@ -17,14 +17,12 @@ import (
 // directly on the fd via unix.Read/unix.Write; Close is guarded so it is safe
 // to call multiple times.
 //
-// A net.Conn deadline is an absolute time, while the socket option that can
-// enforce one (SO_RCVTIMEO) is a relative interval, so SetReadDeadline is
-// implemented by recomputing the remaining time and re-applying SO_RCVTIMEO on
-// every Read: a stalled peer that stops mid-frame surfaces as
-// os.ErrDeadlineExceeded instead of blocking the serving goroutine (and its fd)
-// until process shutdown. SetWriteDeadline/SetDeadline remain no-ops; the
-// exporter always writes a full frame and the send path is not exposed to
-// untrusted peers.
+// A net.Conn deadline is an absolute time, while SO_RCVTIMEO/SO_SNDTIMEO are
+// relative intervals, so Read and Write recompute the remaining time and re-arm
+// the corresponding socket option on every call. A stalled peer therefore
+// surfaces as os.ErrDeadlineExceeded instead of blocking a serving goroutine
+// (and its fd) until process shutdown. This protects both the receiver reading
+// untrusted guests and the new host-to-guest update responses.
 type VsockConn struct {
 	fd           int
 	closeErr     error
@@ -36,6 +34,8 @@ type VsockConn struct {
 	// had a deadline keeps timing out after the deadline is cleared, and the
 	// resulting EAGAIN surfaces as a raw errno instead of a clean blocking read.
 	rcvTimeoutSet bool
+	writeDeadline time.Time
+	sndTimeoutSet bool
 }
 
 // NewVsockConn wraps an already-connected AF_VSOCK file descriptor.
@@ -101,9 +101,43 @@ func (c *VsockConn) Read(b []byte) (int, error) {
 	return n, err
 }
 
-// Write implements io.Writer over the raw fd.
+// Write implements io.Writer over the raw fd. When a write deadline is set,
+// SO_SNDTIMEO is recomputed for every short write and EAGAIN/EWOULDBLOCK is
+// translated to os.ErrDeadlineExceeded.
 func (c *VsockConn) Write(b []byte) (int, error) {
-	return unix.Write(c.fd, b)
+	c.mu.Lock()
+	deadline := c.writeDeadline
+	armed := c.sndTimeoutSet
+	c.mu.Unlock()
+
+	switch {
+	case !deadline.IsZero():
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return 0, os.ErrDeadlineExceeded
+		}
+		tv := unix.NsecToTimeval(remaining.Nanoseconds())
+		if err := unix.SetsockoptTimeval(c.fd, unix.SOL_SOCKET, unix.SO_SNDTIMEO, &tv); err != nil {
+			return 0, err
+		}
+		c.mu.Lock()
+		c.sndTimeoutSet = true
+		c.mu.Unlock()
+	case armed:
+		tv := unix.NsecToTimeval(0)
+		if err := unix.SetsockoptTimeval(c.fd, unix.SOL_SOCKET, unix.SO_SNDTIMEO, &tv); err != nil {
+			return 0, err
+		}
+		c.mu.Lock()
+		c.sndTimeoutSet = false
+		c.mu.Unlock()
+	}
+
+	n, err := unix.Write(c.fd, b)
+	if err != nil && (err == unix.EAGAIN || err == unix.EWOULDBLOCK) && !deadline.IsZero() && n <= 0 {
+		return 0, os.ErrDeadlineExceeded
+	}
+	return n, err
 }
 
 // Close shuts down and closes the underlying fd. It is safe to call multiple
@@ -116,10 +150,14 @@ func (c *VsockConn) Close() error {
 	return c.closeErr
 }
 
-// SetDeadline is a no-op: only read deadlines are enforced on AF_VSOCK (the
-// receiver is the side exposed to untrusted guests and the only side that can
-// stall on a read).
+// SetDeadline sets both read and write absolute deadlines. The next Read or
+// Write arms the corresponding socket timeout; a zero t disarms both as each
+// operation observes the cleared deadline.
 func (c *VsockConn) SetDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.readDeadline = t
+	c.writeDeadline = t
+	c.mu.Unlock()
 	return nil
 }
 
@@ -135,8 +173,14 @@ func (c *VsockConn) SetReadDeadline(t time.Time) error {
 	return nil
 }
 
-// SetWriteDeadline is a no-op (see SetDeadline).
+// SetWriteDeadline sets the absolute time after which a blocked Write returns
+// os.ErrDeadlineExceeded. It is enforced via SO_SNDTIMEO recomputed per Write,
+// including every iteration of SendData's short-write loop. A zero t clears the
+// deadline; the next Write disarms SO_SNDTIMEO and blocks normally.
 func (c *VsockConn) SetWriteDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.writeDeadline = t
+	c.mu.Unlock()
 	return nil
 }
 

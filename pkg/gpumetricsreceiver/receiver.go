@@ -3,11 +3,13 @@ package gpumetricsreceiver
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"go.mws.cloud/gpu-metrics-exporter/pkg/exporterupdate"
 	"go.mws.cloud/gpu-metrics-exporter/pkg/gpumetrics"
 	"go.mws.cloud/gpu-metrics-exporter/pkg/vsock/common"
 	"go.mws.cloud/gpu-metrics-exporter/pkg/vsock/server"
@@ -35,6 +37,13 @@ type GpuMetricsReceiverConfig struct {
 	MaxConnections       int
 	MaxConnectionsPerCID int
 	ReadTimeout          time.Duration
+	WriteTimeout         time.Duration
+	// ExporterDebPath and ExporterVersion enable host-side package updates.
+	// They must be set together; both empty serves metrics only. The version is
+	// supplied by the operator because the receiver never parses the .deb or
+	// executes dpkg-deb (it may run in a minimal pod).
+	ExporterDebPath string
+	ExporterVersion string
 }
 
 // GpuMetricsReceiver accepts exporter connections over vsock, decodes each
@@ -53,6 +62,8 @@ type GpuMetricsReceiver struct {
 	maxConnections       int
 	maxConnectionsPerCID int
 	readTimeout          time.Duration
+	writeTimeout         time.Duration
+	updateServer         *exporterupdate.Server
 }
 
 // NewGpuMetricsReceiver constructs a receiver from config. Zero-valued
@@ -70,6 +81,9 @@ func NewGpuMetricsReceiver(config GpuMetricsReceiverConfig) *GpuMetricsReceiver 
 	if config.ReadTimeout == 0 {
 		config.ReadTimeout = defaultReadTimeout
 	}
+	if config.WriteTimeout == 0 {
+		config.WriteTimeout = defaultWriteTimeout
+	}
 	r := &GpuMetricsReceiver{
 		log:                  log,
 		config:               config,
@@ -79,6 +93,7 @@ func NewGpuMetricsReceiver(config GpuMetricsReceiverConfig) *GpuMetricsReceiver 
 		maxConnections:       config.MaxConnections,
 		maxConnectionsPerCID: config.MaxConnectionsPerCID,
 		readTimeout:          config.ReadTimeout,
+		writeTimeout:         config.WriteTimeout,
 	}
 	r.stopping.Store(0)
 	return r
@@ -87,11 +102,13 @@ func NewGpuMetricsReceiver(config GpuMetricsReceiverConfig) *GpuMetricsReceiver 
 // Resource-limit defaults applied by NewGpuMetricsReceiver when the config
 // leaves them at zero. They are conservative: one VM should not need dozens of
 // simultaneous exporter connections, and a frame must arrive well within a
-// minute.
+// minute. WriteTimeout likewise stops a guest that no longer reads an update
+// response from pinning a serving goroutine.
 const (
 	defaultMaxConnections       = 64
 	defaultMaxConnectionsPerCID = 4
 	defaultReadTimeout          = 60 * time.Second
+	defaultWriteTimeout         = 60 * time.Second
 )
 
 func (r *GpuMetricsReceiver) shutdown() {
@@ -162,10 +179,10 @@ func (r *GpuMetricsReceiver) setListener(l *server.VsockListener) {
 	r.connectionsMu.Unlock()
 }
 
-// handleConnection serves one exporter connection: reads framed GpuMetrics
-// payloads in a loop, dispatching each via processFrame, until the exporter
-// sends its close-frame (ErrNoData), the connection breaks, a read times out,
-// or the receiver is stopping.
+// handleConnection serves one exporter connection. The first frame selects the
+// protocol for the connection's lifetime: update magic enters the bounded
+// request/response update server, while every other frame follows the existing
+// gzip metrics path. Both paths use the same peer-CID and connection accounting.
 func (r *GpuMetricsReceiver) handleConnection(conn *common.VsockConn) {
 	defer r.wg.Done()
 
@@ -201,8 +218,15 @@ func (r *GpuMetricsReceiver) handleConnection(conn *common.VsockConn) {
 			_ = conn.Close()
 		}
 	}()
+	r.serveFrames(conn, cid)
+}
+
+// serveFrames is separated from peer-address lookup and teardown so tests can
+// exercise both protocol paths with a real CID over an AF_UNIX socketpair.
+func (r *GpuMetricsReceiver) serveFrames(conn *common.VsockConn, cid uint32) {
 	r.log.Info("exporter connected", zap.Any("remote", conn.RemoteAddr()))
 
+	firstFrame := true
 	for r.stopping.Load() == 0 {
 		// Reset the per-frame read deadline so a guest that stalls mid-stream
 		// (or after sending just a header) is dropped instead of pinning this
@@ -225,6 +249,26 @@ func (r *GpuMetricsReceiver) handleConnection(conn *common.VsockConn) {
 			r.log.Error("RecvData", zap.Error(err))
 			break
 		}
+
+		if firstFrame && exporterupdate.IsRequestFrame(data) {
+			if cid < 3 {
+				r.log.Error("unexpected update clientID", zap.Uint32("clientID", cid))
+				break
+			}
+			server := r.updateServer
+			if server == nil {
+				server = &exporterupdate.Server{}
+			}
+			if err := server.Serve(conn, data, r.readTimeout, r.writeTimeout); err != nil {
+				if errors.Is(err, os.ErrDeadlineExceeded) {
+					r.log.Warn("update connection timeout", zap.Uint32("clientID", cid), zap.Error(err))
+				} else {
+					r.log.Warn("update connection", zap.Uint32("clientID", cid), zap.Error(err))
+				}
+			}
+			break
+		}
+		firstFrame = false
 
 		if !r.processFrame(cid, data) {
 			break
@@ -326,6 +370,27 @@ func (r *GpuMetricsReceiver) Run(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
+
+	var updatePackage *exporterupdate.Package
+	switch {
+	case r.config.ExporterDebPath == "" && r.config.ExporterVersion == "":
+		// Metrics-only receiver; update requests receive StatusUnavailable.
+	case r.config.ExporterDebPath == "" || r.config.ExporterVersion == "":
+		return fmt.Errorf("exporter update requires both package path and version")
+	default:
+		pkg, err := exporterupdate.OpenPackage(r.config.ExporterDebPath, r.config.ExporterVersion)
+		if err != nil {
+			return err
+		}
+		updatePackage = pkg
+		meta := pkg.Metadata()
+		r.log.Info("serving exporter update package",
+			zap.String("version", meta.Version), zap.Int64("size", meta.Size))
+		// Registered before the shutdown defer below, so it runs after all
+		// connection goroutines have stopped using the open snapshot.
+		defer func() { _ = pkg.Close() }()
+	}
+	r.updateServer = &exporterupdate.Server{Package: updatePackage}
 
 	l, err := server.NewVsockListener(r.log, r.config.ListenPort)
 	if err != nil {
