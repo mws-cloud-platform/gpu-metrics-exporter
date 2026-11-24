@@ -291,11 +291,14 @@ func TestMultipleFramesInStream(t *testing.T) {
 // TestCloseIdempotent verifies closeOnce: a second Close must not panic or
 // double-close the fd in a way that surfaces a non-nil error crash.
 func TestCloseIdempotent(t *testing.T) {
-	r, w, err := os.Pipe()
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
 	if err != nil {
-		t.Fatalf("os.Pipe: %v", err)
+		t.Fatalf("unix.Socketpair: %v", err)
 	}
-	conn := NewVsockConn(int(w.Fd()))
+	// No os.File retains the fd: its finalizer could otherwise close a reused
+	// descriptor after VsockConn has already closed it.
+	conn := NewVsockConn(fds[0])
+	defer func() { _ = unix.Close(fds[1]) }()
 
 	if err := conn.Close(); err != nil {
 		t.Fatalf("first Close: %v", err)
@@ -306,7 +309,6 @@ func TestCloseIdempotent(t *testing.T) {
 		// we expect the cached (nil) error from the first call.
 		t.Fatalf("second Close returned error: %v", err)
 	}
-	_ = r.Close()
 }
 
 func TestVsockAddrString(t *testing.T) {

@@ -270,6 +270,7 @@ type fakeHost struct {
 	size        int64
 	metadataErr error
 	downloadErr error
+	badDigest   bool
 	apiCalls    atomic.Int32
 	downloads   atomic.Int32
 }
@@ -287,10 +288,14 @@ func (f *fakeHost) GetMetadata(context.Context) (exporterupdate.Metadata, error)
 	if size == 0 {
 		size = int64(len(f.pkg))
 	}
+	sum := sha256.Sum256(f.pkg)
+	if f.badDigest {
+		sum[0]++
+	}
 	return exporterupdate.Metadata{
 		Version: f.tag,
 		Size:    size,
-		SHA256:  sha256.Sum256(f.pkg),
+		SHA256:  sum,
 	}, nil
 }
 
@@ -495,6 +500,12 @@ func TestUpdateRejectsBadHostPackage(t *testing.T) {
 		{"implausible size", func(f *fakeHost) {
 			f.size = exporterupdate.MaxPackageSize + 1
 		}, "invalid size"},
+		{"short download", func(f *fakeHost) {
+			f.size = int64(len(f.pkg) + 1)
+		}, "size"},
+		{"digest mismatch", func(f *fakeHost) {
+			f.badDigest = true
+		}, "does not match"},
 		{"host version is not a release", func(f *fakeHost) {
 			f.tag = newTag + "-1-gabc1234"
 			f.pkg = pkgFile(packageName, f.tag, "amd64")

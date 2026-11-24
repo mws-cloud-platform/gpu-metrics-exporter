@@ -24,9 +24,10 @@ import (
 // connections. MaxConnectionsPerCID bounds concurrent connections per guest VM
 // (by peer CID). ReadTimeout bounds how long a single framed read may block
 // before the connection is dropped, so a guest that opens a connection and then
-// stalls cannot pin a goroutine and fd.
+// stalls cannot pin a goroutine and fd. WriteTimeout does the same for update
+// responses to a guest that stops reading.
 //
-// For all three, a zero value means "use the default" — NewGpuMetricsReceiver
+// For all four, a zero value means "use the default" — NewGpuMetricsReceiver
 // substitutes one, so an under-specified config is still bounded against
 // untrusted guests. Pass a negative value to disable a limit outright; that is
 // the only way to opt out, and it should be a deliberate choice.

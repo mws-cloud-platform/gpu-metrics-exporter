@@ -9,7 +9,9 @@
 package selfupdate
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -192,13 +194,26 @@ func (u *Updater) Update(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	downloadErr := u.source.Download(ctx, candidate, f)
+	// Verify at the install boundary too, independently of the transport's own
+	// checks: every packageSource must meet the same integrity contract.
+	h := sha256.New()
+	downloadErr := u.source.Download(ctx, candidate, io.MultiWriter(f, h))
+	fi, statErr := f.Stat()
 	closeErr := f.Close()
 	if downloadErr != nil {
 		return downloadErr
 	}
+	if statErr != nil {
+		return statErr
+	}
 	if closeErr != nil {
 		return closeErr
+	}
+	if fi.Size() != candidate.Size {
+		return fmt.Errorf("downloaded package size %d does not match host metadata %d", fi.Size(), candidate.Size)
+	}
+	if got := h.Sum(nil); !bytes.Equal(got, candidate.SHA256[:]) {
+		return fmt.Errorf("downloaded package sha256 %x does not match host metadata %x", got, candidate.SHA256)
 	}
 	u.printf("size and sha256 match the host package metadata\n")
 	if err := u.checkPackage(path, candidate.Version); err != nil {

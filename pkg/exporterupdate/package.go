@@ -7,8 +7,9 @@ import (
 	"os"
 )
 
-// Package is an open, immutable-by-path snapshot of the exporter .deb served
-// to guests. ReadAt does not change shared file offset and is safe concurrently.
+// Package is an open snapshot of the exporter .deb served to guests. Replacing
+// its path does not change the open file. ReadAt does not change shared file
+// offset and is safe concurrently.
 type Package struct {
 	file     *os.File
 	metadata Metadata

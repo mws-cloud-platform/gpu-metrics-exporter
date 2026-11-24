@@ -12,11 +12,33 @@ import (
 // Server serves update commands after the receiver has read and classified the
 // first frame. The receiver remains responsible for peer CID and connection
 // limits; closing the connection interrupts Serve during receiver shutdown.
+// Each connection also has request and range-byte budgets, so a guest cannot
+// keep a slot forever by issuing an unbounded sequence of valid reads.
 type Server struct {
 	Package *Package
+
+	// Zero values use defaults sized for one maximum-size package using client
+	// chunks. Tests lower them to exercise the limits without large transfers.
+	maxRequests  int
+	maxReadBytes uint64
 }
 
+const (
+	defaultMaxRequests  = 2048 // 1094 requests suffice for 64 MiB at 60 KiB plus metadata
+	defaultMaxReadBytes = uint64(MaxPackageSize)
+)
+
 func (s *Server) Serve(conn *common.VsockConn, first []byte, readTimeout, writeTimeout time.Duration) error {
+	requestLimit := s.maxRequests
+	if requestLimit <= 0 {
+		requestLimit = defaultMaxRequests
+	}
+	byteLimit := s.maxReadBytes
+	if byteLimit == 0 {
+		byteLimit = defaultMaxReadBytes
+	}
+	requests := 0
+	var readBytes uint64
 	data := first
 	for {
 		req, err := ParseRequest(data)
@@ -25,11 +47,37 @@ func (s *Server) Serve(conn *common.VsockConn, first []byte, readTimeout, writeT
 			if writeErr := writeResponse(conn, resp, writeTimeout); writeErr != nil {
 				return writeErr
 			}
+			if waitErr := waitForPeerClose(conn, readTimeout); waitErr != nil {
+				return waitErr
+			}
 			return err
 		}
+		if requests >= requestLimit {
+			if err := writeResponse(conn, workLimitResponse(req, "update request limit reached"), writeTimeout); err != nil {
+				return err
+			}
+			return waitForPeerClose(conn, readTimeout)
+		}
+		requests++
+
 		resp := s.respond(req)
+		limitReached := false
+		if req.Command == CommandRead && resp.Status == StatusOK {
+			n := uint64(len(resp.Payload))
+			// Written this way rather than readBytes+n > byteLimit to avoid
+			// overflow even with test-specific limits.
+			if n > byteLimit || readBytes > byteLimit-n {
+				resp = workLimitResponse(req, "update range-byte limit reached")
+				limitReached = true
+			} else {
+				readBytes += n
+			}
+		}
 		if err := writeResponse(conn, resp, writeTimeout); err != nil {
 			return err
+		}
+		if limitReached {
+			return waitForPeerClose(conn, readTimeout)
 		}
 
 		if readTimeout > 0 {
@@ -45,6 +93,30 @@ func (s *Server) Serve(conn *common.VsockConn, first []byte, readTimeout, writeT
 			return fmt.Errorf("read update request: %w", err)
 		}
 	}
+}
+
+func waitForPeerClose(conn *common.VsockConn, timeout time.Duration) error {
+	// Closing immediately after a terminal response can race with the peer's read
+	// on some stream transports. Wait for the client to close after it receives
+	// the error, with one absolute deadline for a peer that keeps the fd open.
+	if timeout > 0 {
+		if err := conn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
+			return err
+		}
+	}
+	for {
+		_, err := conn.RecvData()
+		if errors.Is(err, common.ErrNoData) || errors.Is(err, io.EOF) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+	}
+}
+
+func workLimitResponse(req Request, message string) Response {
+	return Response{Command: req.Command, Status: StatusBadRequest, Offset: req.Offset, Payload: []byte(message)}
 }
 
 func (s *Server) respond(req Request) Response {

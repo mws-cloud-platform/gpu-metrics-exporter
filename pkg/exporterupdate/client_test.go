@@ -347,3 +347,38 @@ func TestGetMetadataHonoursContext(t *testing.T) {
 		t.Fatalf("metadata cancellation took too long: %v", time.Since(start))
 	}
 }
+
+func TestServerConnectionWorkLimits(t *testing.T) {
+	pkg := testPackage(t, bytes.Repeat([]byte("z"), 16), "2026.11.24-1")
+	t.Run("request count", func(t *testing.T) {
+		conn := startUpdateServer(t, &Server{Package: pkg, maxRequests: 2})
+		c := &Client{}
+		if _, err := c.roundTrip(t.Context(), conn, Request{Command: CommandGetVersion}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.roundTrip(t.Context(), conn, Request{Command: CommandRead, Length: 1}); err != nil {
+			t.Fatal(err)
+		}
+		resp, err := ReadResponseAfterRequest(conn, Request{Command: CommandRead, Offset: 1, Length: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.Status != StatusBadRequest || !bytes.Contains(resp.Payload, []byte("request limit")) {
+			t.Fatalf("request limit response: %+v %q", resp, resp.Payload)
+		}
+	})
+	t.Run("range bytes", func(t *testing.T) {
+		conn := startUpdateServer(t, &Server{Package: pkg, maxReadBytes: 3})
+		c := &Client{}
+		if _, err := c.roundTrip(t.Context(), conn, Request{Command: CommandRead, Length: 2}); err != nil {
+			t.Fatal(err)
+		}
+		resp, err := ReadResponseAfterRequest(conn, Request{Command: CommandRead, Offset: 2, Length: 2})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if resp.Status != StatusBadRequest || !bytes.Contains(resp.Payload, []byte("range-byte limit")) || len(resp.Payload) > maxErrorSize {
+			t.Fatalf("byte limit response: %+v %q", resp, resp.Payload)
+		}
+	})
+}

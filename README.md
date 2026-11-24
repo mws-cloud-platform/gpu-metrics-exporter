@@ -67,6 +67,12 @@ from sending a partial frame and going silent; the write deadline does the same
 when a guest stops reading an update response. Neither can pin a goroutine and
 an fd until the process exits.
 
+Each update connection is additionally limited to 2048 requests and 64 MiB of
+range data, enough for a maximum-size package using normal 60-KiB chunks.
+Repeated ranges consume the same budget. Terminal errors are written before the
+server waits, with a bounded read deadline, for the client to close. These are
+per-connection work bounds, not a bandwidth quota across reconnects.
+
 The same listener also serves exporter updates. To enable that path, set both
 environment variables on the receiver:
 
@@ -80,7 +86,9 @@ also works in a minimal pod with the package mounted read-only. The operator
 supplies the version through the second variable. At startup the receiver opens
 the regular file, checks that it is no larger than 64 MiB, and calculates its
 SHA-256. Guests get that version, size and digest, then verify the downloaded
-package's control file themselves. A mismatch between the environment version
+package's control file themselves. The updater recomputes size and SHA-256 at
+the install boundary independently of the transport client, so every package
+source is held to the same integrity contract. A mismatch between the environment version
 and the package is therefore rejected before installation.
 
 The open file, metadata and digest form one snapshot. Replace the package path
