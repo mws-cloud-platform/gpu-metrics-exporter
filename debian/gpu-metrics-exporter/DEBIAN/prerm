@@ -1,4 +1,11 @@
 #!/bin/sh
 set -e
+# Auto-update goes with the package. Only on removal: on an upgrade the update
+# service may be what runs this very dpkg, and stopping it would kill dpkg
+# halfway. A timer left enabled is the admin's choice, which upgrades keep.
+if [ "$1" = remove ]; then
+	systemctl disable --now gpu-metrics-exporter-update.timer || true
+	systemctl stop gpu-metrics-exporter-update.service || true
+fi
 systemctl disable gpu-metrics-exporter
 systemctl stop gpu-metrics-exporter

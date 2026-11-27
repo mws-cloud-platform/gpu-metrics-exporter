@@ -291,11 +291,14 @@ func TestMultipleFramesInStream(t *testing.T) {
 // TestCloseIdempotent verifies closeOnce: a second Close must not panic or
 // double-close the fd in a way that surfaces a non-nil error crash.
 func TestCloseIdempotent(t *testing.T) {
-	r, w, err := os.Pipe()
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
 	if err != nil {
-		t.Fatalf("os.Pipe: %v", err)
+		t.Fatalf("unix.Socketpair: %v", err)
 	}
-	conn := NewVsockConn(int(w.Fd()))
+	// No os.File retains the fd: its finalizer could otherwise close a reused
+	// descriptor after VsockConn has already closed it.
+	conn := NewVsockConn(fds[0])
+	defer func() { _ = unix.Close(fds[1]) }()
 
 	if err := conn.Close(); err != nil {
 		t.Fatalf("first Close: %v", err)
@@ -306,7 +309,6 @@ func TestCloseIdempotent(t *testing.T) {
 		// we expect the cached (nil) error from the first call.
 		t.Fatalf("second Close returned error: %v", err)
 	}
-	_ = r.Close()
 }
 
 func TestVsockAddrString(t *testing.T) {
@@ -356,5 +358,39 @@ func TestReadDeadlineExpiredBeforeRead(t *testing.T) {
 	_, err := receiver.RecvData()
 	if !errors.Is(err, os.ErrDeadlineExceeded) {
 		t.Fatalf("expected os.ErrDeadlineExceeded, got %v", err)
+	}
+}
+
+func TestWriteDeadlineExceeded(t *testing.T) {
+	sender, _ := newSocketpairConns(t)
+	if err := unix.SetsockoptInt(sender.fd, unix.SOL_SOCKET, unix.SO_SNDBUF, 4096); err != nil {
+		t.Fatal(err)
+	}
+	if err := sender.SetWriteDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		// The receiver never reads. writeAll must keep looping after a short
+		// write and eventually surface the absolute deadline, not hang.
+		done <- sender.writeAll(make([]byte, 1<<20))
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, os.ErrDeadlineExceeded) {
+			t.Fatalf("writeAll error = %v, want deadline exceeded", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("blocked write did not honour its deadline")
+	}
+}
+
+func TestWriteDeadlineExpiredBeforeWrite(t *testing.T) {
+	sender, _ := newSocketpairConns(t)
+	if err := sender.SetDeadline(time.Now().Add(-time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sender.Write([]byte("x")); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("Write with expired SetDeadline = %v, want deadline exceeded", err)
 	}
 }

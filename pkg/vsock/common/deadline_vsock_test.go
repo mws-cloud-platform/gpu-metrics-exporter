@@ -185,3 +185,26 @@ func TestVsockReadDeadlineCleared(t *testing.T) {
 		t.Fatalf("payload = %q, want %q", got, payload)
 	}
 }
+
+// TestVsockWriteDeadlineEnforced is the write-side counterpart of the real
+// AF_VSOCK read test: a guest that stops reading package bytes must not pin the
+// host's serving goroutine. The peer is intentionally never read from.
+func TestVsockWriteDeadlineEnforced(t *testing.T) {
+	client, _ := newVsockLoopbackConns(t, 54335)
+	if err := unix.SetsockoptInt(client.fd, unix.SOL_SOCKET, unix.SO_SNDBUF, 4096); err != nil {
+		t.Fatal(err)
+	}
+	const timeout = 300 * time.Millisecond
+	if err := client.SetWriteDeadline(time.Now().Add(timeout)); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	err := client.writeAll(make([]byte, 16<<20))
+	elapsed := time.Since(start)
+	if !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("writeAll to unread vsock peer = %v, want deadline exceeded", err)
+	}
+	if elapsed < timeout/2 {
+		t.Fatalf("write returned after %v, well before %v: SO_SNDTIMEO did not enforce the wait", elapsed, timeout)
+	}
+}

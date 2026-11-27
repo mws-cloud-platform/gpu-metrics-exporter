@@ -7,8 +7,9 @@
 # <package>  gpu-metrics-exporter | gpu-metrics-receiver
 # [version]  deb version; defaults to $VERSION env, then `git describe --tags --always`.
 #
-# Expects the linux/amd64 binary at bin/<package> and the unit at
-# systemd/<package>.service (produce both with `make docker-build`).
+# Expects the linux/amd64 binary at bin/<package> (produce it with
+# `make docker-build`) and the unit at systemd/<package>.service. Any other
+# systemd/<package>-*.service or -*.timer ships too (the exporter's auto-update).
 set -eu
 
 PKG="${1:-}"
@@ -58,7 +59,7 @@ install -d "$STAGING/DEBIAN" \
 
 # Metadata. Substitute the version placeholder and keep scripts executable.
 sed "s/__VERSION__/$VERSION/g" "$TEMPLATE/DEBIAN/control" > "$STAGING/DEBIAN/control"
-for script in postinst prerm postrm; do
+for script in preinst postinst prerm postrm; do
 	if [ -f "$TEMPLATE/DEBIAN/$script" ]; then
 		install -m 0755 "$TEMPLATE/DEBIAN/$script" "$STAGING/DEBIAN/$script"
 	fi
@@ -67,7 +68,10 @@ chmod 0644 "$STAGING/DEBIAN/control"
 
 # Payload.
 install -m 0755 "$BINARY"  "$STAGING/usr/local/bin/$PKG"
-install -m 0644 "$SERVICE" "$STAGING/etc/systemd/system/$(basename "$SERVICE")"
+for unit in "$SERVICE" "$ROOT/systemd/$PKG"-*.service "$ROOT/systemd/$PKG"-*.timer; do
+	[ -f "$unit" ] || continue # a glob that matched nothing
+	install -m 0644 "$unit" "$STAGING/etc/systemd/system/$(basename "$unit")"
+done
 
 # Licenses: ship the Apache 2.0 license, NOTICE, and bundled third-party
 # licenses so each .deb is self-contained (Apache 2.0 §4 / NOTICE obligation).

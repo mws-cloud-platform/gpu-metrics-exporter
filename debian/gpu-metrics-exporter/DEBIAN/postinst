@@ -3,3 +3,15 @@ set -e
 systemctl daemon-reload
 systemctl enable gpu-metrics-exporter
 systemctl start gpu-metrics-exporter
+
+# Auto-update, when preinst found its timer new. Failing to turn it on must not
+# fail the install -- the exporter runs without it -- and keeps the flag, so the
+# next configure tries again.
+flag=/var/lib/gpu-metrics-exporter/enable-auto-update
+if [ "$1" = configure ] && [ -e "$flag" ]; then
+	if systemctl enable --now gpu-metrics-exporter-update.timer; then
+		rm -f "$flag"
+	else
+		echo "gpu-metrics-exporter: could not turn auto-update on; try: gpu-metrics-exporter auto-update enable" >&2
+	fi
+fi

@@ -26,8 +26,8 @@ where 3 (or another number >2) should be a unique guest VM ID (CID) on the host.
 The host vsock socket always has `cid = 2`.
 
 The host vsock specifies the port number on which it accepts incoming connections;
-the guest side uses this port to connect to the host. The CLI default is port 1234;
-the deployed systemd units (see `systemd/`) use port 9999.
+the guest side uses this port to connect to the host. The exporter CLI default is
+port 9999; the deployed systemd units (see `systemd/`) use the same port.
 
 So VSOCK provides socket-based client and server libraries;
 see `pkg/vsock` code.
@@ -52,18 +52,50 @@ The GPU metrics collector should convert CID into VMID, for example by parsing
 and searching in running qemu command lines.
 
 Guests are less trusted than the host, so the receiver bounds what one can
-consume. `GpuMetricsReceiverConfig` exposes three limits, each defaulted when
+consume. `GpuMetricsReceiverConfig` exposes these limits, each defaulted when
 left at zero:
 
 | Field | Default | Purpose |
 | --- | --- | --- |
-| `MaxConnections` | 64 | Total simultaneous guest connections |
+| `MaxConnections` | 64 | Total simultaneous guest connections, metrics and updates combined |
 | `MaxConnectionsPerCID` | 4 | Simultaneous connections from one VM |
 | `ReadTimeout` | 60 s | Per-frame read deadline |
+| `WriteTimeout` | 60 s | Per-response write deadline for package downloads |
 
-Connections over a limit are closed immediately. The read deadline is what stops
-a guest from opening a connection, sending a frame header, and going silent to
-pin a goroutine and an fd until the process exits.
+Connections over a limit are closed immediately. The read deadline stops a guest
+from sending a partial frame and going silent; the write deadline does the same
+when a guest stops reading an update response. Neither can pin a goroutine and
+an fd until the process exits.
+
+Each update connection is additionally limited to 2048 requests and 64 MiB of
+range data, enough for a maximum-size package using normal 60-KiB chunks.
+Repeated ranges consume the same budget. Terminal errors are written before the
+server waits, with a bounded read deadline, for the client to close. These are
+per-connection work bounds, not a bandwidth quota across reconnects.
+
+The same listener also serves exporter updates. To enable that path, set both
+environment variables on the receiver:
+
+```text
+GPU_METRICS_RECEIVER_EXPORTER_DEB=/packages/gpu-metrics-exporter_2026.11.24-1_amd64.deb
+GPU_METRICS_RECEIVER_EXPORTER_VERSION=2026.11.24-1
+```
+
+The receiver runs no external commands and never invokes `dpkg-deb`, so this
+also works in a minimal pod with the package mounted read-only. The operator
+supplies the version through the second variable. At startup the receiver opens
+the regular file, checks that it is no larger than 64 MiB, and calculates its
+SHA-256. Guests get that version, size and digest, then verify the downloaded
+package's control file themselves. The updater recomputes size and SHA-256 at
+the install boundary independently of the transport client, so every package
+source is held to the same integrity contract. A mismatch between the environment version
+and the package is therefore rejected before installation.
+
+The open file, metadata and digest form one snapshot. Replace the package path
+atomically and restart the receiver to publish another version; in-place edits
+or an environment change do not reload it. If both variables are empty, metrics
+work normally and update requests receive an explicit "unavailable" error.
+Setting only one is a startup configuration error.
 
 ### Attested channel (pci-attest)
 The exporter also hands every payload to the QEMU `pci-attest` device (PCI id
@@ -127,9 +159,11 @@ counter (`sbe_pages`, `correctable`, …), which every payload carries in full;
 
 The exporter runs inside a guest VM. Exporter and receiver ship as independent
 `.deb` packages, and an exporter can stay deployed for a long time, so the
-receiver must decode every format version it has ever shipped. The protocol is
-one-way — the exporter never reads anything back — so all compatibility work
-lives on the receiver.
+receiver must decode every format version it has ever shipped. The metrics
+protocol is one-way — the exporter never reads a metrics response — so all
+metrics compatibility work lives on the receiver. The separate update protocol
+on the same port is request/response and has its own version; it does not alter
+`wire_version`.
 
 `NewGpuMetricsFromBytes` reads `wire_version` first, decodes the payload with
 the matching struct, and upconverts it to the current shape. **Consumers always
@@ -430,7 +464,7 @@ The exporter supports configuration via both environment variables (with optiona
 
 | Environment Variable | CLI Flag | Default | Description |
 | --- | --- | --- | --- |
-| `GPU_METRICS_EXPORTER_SERVER_PORT` / `SERVER_PORT` | `-serverPort` | `1234` (systemd / k8s: `9999`) | Destination vsock port on host CID 2 |
+| `GPU_METRICS_EXPORTER_SERVER_PORT` / `SERVER_PORT` | `-serverPort` | `9999` | Destination vsock port on host CID 2 |
 | `GPU_METRICS_EXPORTER_TICK_PERIOD` / `TICK_PERIOD` | `-tickPeriod` | `10` (systemd / k8s: `60`) | Collection interval in seconds |
 | `GPU_METRICS_EXPORTER_LOG_LEVEL` / `LOG_LEVEL` | `-logLevel` | `info` | Logging level (`debug`, `info`, `warn`, `error`) |
 | `GPU_METRICS_EXPORTER_NVML_LIB_PATH` / `NVML_LIB_PATH` | `-nvmlLibPath` | `""` (auto) | Explicit path to `libnvidia-ml.so.1` |
@@ -467,6 +501,123 @@ Or apply raw Kubernetes manifests:
 ```bash
 kubectl apply -f k8s/daemonset.yaml
 ```
+
+## Updating
+
+On a VM where the exporter was installed from the `.deb`, one command upgrades
+it to the package served by its host and restarts the service:
+
+```bash
+sudo gpu-metrics-exporter update
+gpu-metrics-exporter update -check  # needs no root
+```
+
+The updater connects to host CID 2 on the **same vsock port used for metrics**.
+The receiver distinguishes the versioned update protocol by the first frame's
+magic, so no second listener is needed. `GET_VERSION`
+returns the host's version, package size and SHA-256. The guest then sends
+`READ(offset, length)` requests and receives up to 60 KiB per response, truncated
+at EOF, until the announced size has been downloaded. There is no HTTP client,
+GitHub API request or network fallback.
+
+Configure the package and its externally supplied version on the receiver as
+described [above](#gpu-metrics-receiver). After download, the guest verifies the
+whole file's size and SHA-256 and uses `dpkg-deb --field` locally to check that
+its control file names `gpu-metrics-exporter`, `amd64` and exactly the announced
+version. Only then does it run `dpkg -i`. Thus a receiver environment version
+that does not match the mounted `.deb` cannot cause an installation.
+
+The service is left as it was, enabled or disabled, running or stopped. If it
+was running, it now runs the new binary. Every release's maintainer scripts
+disable and stop the service, then enable and start it again, whatever state it
+was in, so `update` restores that state itself. A stopped service is a special
+case: installing the package would start it, and on a Kubernetes node, where
+the DaemonSet runs the exporter, two exporters on one VM corrupt each other's
+stream (see [above](#mutual-exclusion-with-systemd-deb-package)). So `update`
+refuses while the service is stopped, unless given `-force`, which updates
+anyway and stops the service again right after.
+
+| Flag | Effect |
+| --- | --- |
+| `-check` | Report whether the host has a newer package; change nothing |
+| `-force` | Install the host package even when it is not newer than the installed one, when the installed version cannot be compared (a development build), or while the service is stopped |
+| `-serverPort` | Host vsock port; overrides `GPU_METRICS_EXPORTER_SERVER_PORT` / `SERVER_PORT` |
+
+`update` refuses to run:
+
+- **in a Kubernetes pod.** There the exporter comes from the DaemonSet's image,
+  which the cluster admin rolls out (`helm upgrade`, or a new image tag);
+- without root, or on a system not running systemd;
+- **where the package is not installed.** `update` upgrades; it does not
+  install. Install the first `.deb` by hand.
+
+Releases up to and including `2026.10.06-1` do not know the command: they
+ignore the argument and start a second exporter in the foreground, next to the
+service. Upgrade those once by hand
+(`sudo dpkg -i gpu-metrics-exporter_<tag>_amd64.deb`). From then on, `update`
+works, and [auto-update](#auto-update) is on.
+
+Both the running exporter and `update` accept `-serverPort` and read
+`GPU_METRICS_EXPORTER_SERVER_PORT`, then `SERVER_PORT`, with CLI default 9999;
+an explicit flag overrides the environment. The packaged exporter and update
+units both pass `-serverPort 9999`, matching the receiver unit. A custom
+exporter installation must configure the same port for `update`, using either
+its flag or the shared environment value. No TCP connectivity, DNS, HTTPS proxy
+or GitHub access is needed by the new updater.
+
+The frame hashes protect individual responses and SHA-256 checks the complete
+transfer; the control-file checks bind those bytes to the announced version.
+The trust decision is the host operator's choice of `.deb`, not independent
+package provenance. This is not a package signature. The pci-attest signature
+still covers only the exporter's code pages, not the package or its maintainer
+scripts, which run as root.
+
+Exporter versions predating vsock update still use their old GitHub updater.
+If such a guest cannot reach GitHub, install a vsock-capable package once by
+hand. New exporters can update only after the host receiver supports the update
+protocol; until then their automatic checks fail temporarily without changing
+the installation.
+
+### Auto-update
+
+The package also installs a systemd timer that runs the same update every
+8 hours. Each check is delayed by up to another hour at random, so a fleet does
+not check, or roll out a release, all at once.
+
+```bash
+gpu-metrics-exporter auto-update status          # on or off, next and last check (needs no root)
+sudo gpu-metrics-exporter auto-update disable    # turn it off
+sudo gpu-metrics-exporter auto-update enable     # turn it back on
+```
+
+Auto-update is on by default. The package turns it on whenever it installs the
+timer for the first time: on a fresh install, on the upgrade from a release
+without it, and on a reinstall after removal. After that, the setting is the
+admin's and upgrades keep it. The setting is the timer's own: `auto-update
+disable` is `systemctl disable --now gpu-metrics-exporter-update.timer`, and
+either one lasts.
+
+An automatic update (`gpu-metrics-exporter-update.service`, which runs
+`update -auto`) does what `update` does, with two differences:
+
+- **It leaves a stopped service alone** instead of refusing. On a Kubernetes
+  node whose DaemonSet runs the exporter, the timer therefore does nothing.
+- **A failure before anything was installed exits with status 75**, which the
+  unit counts as success. That covers an unavailable host update service, a
+  protocol/timeout failure, or a download whose size, digest or control file
+  does not check out. The next check tries again, and a VM without a working
+  host update path does not show a failed unit three times a day. A failed
+  install does fail the unit.
+
+Each run's output is in `journalctl -u gpu-metrics-exporter-update`.
+
+Auto-update follows the package configured on each host, not GitHub's *latest*
+release. Publishing a GitHub Release still produces the signed artifacts but
+does not itself roll them out. To roll out a version, atomically place its
+`.deb` at the configured host path, set `GPU_METRICS_RECEIVER_EXPORTER_VERSION`
+to that release version, and restart the receiver. Each VM with auto-update on
+then picks it up within about 9 hours. The announced version must be a release
+version (`YYYY.MM.DD-N`), not a prerelease or development build.
 
 ## How to build
 ```bash

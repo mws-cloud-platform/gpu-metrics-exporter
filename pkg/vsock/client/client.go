@@ -34,7 +34,7 @@ func NewClientConnection(log *zap.Logger, port int) (*common.VsockConn, error) {
 		log.Warn("SetsockoptTimeval SO_SNDTIMEO", zap.Error(err))
 	}
 
-	// Connect to host (CID=2, port=1234)
+	// Connect to host (CID=2) on the requested port
 	sa := &unix.SockaddrVM{
 		CID:  unix.VMADDR_CID_HOST, // Host is always CID 2
 		Port: uint32(port),

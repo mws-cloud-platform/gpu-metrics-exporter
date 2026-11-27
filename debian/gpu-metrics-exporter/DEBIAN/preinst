@@ -1,0 +1,16 @@
+#!/bin/sh
+set -e
+# Auto-update is on by default, but once its timer is installed, whether it is
+# enabled is the admin's call, which an upgrade must keep. So it is enabled only
+# when this install brings the timer for the first time -- a fresh install, an
+# upgrade from a release without it, a reinstall after removal -- and this flag
+# tells postinst so. It outlives a failed install, to be acted on by the next
+# configure.
+case "$1" in
+install|upgrade)
+	if [ ! -e /etc/systemd/system/gpu-metrics-exporter-update.timer ]; then
+		mkdir -p /var/lib/gpu-metrics-exporter
+		touch /var/lib/gpu-metrics-exporter/enable-auto-update
+	fi
+	;;
+esac

@@ -1,0 +1,19 @@
+[Unit]
+Description=Upgrade gpu-metrics-exporter to the host's version
+Documentation=https://github.com/mws-cloud-platform/gpu-metrics-exporter#auto-update
+
+# Started by gpu-metrics-exporter-update.timer. A unit of its own, never a step
+# of gpu-metrics-exporter.service: the package's prerm stops that service, and
+# with it everything in its cgroup -- dpkg included, halfway through.
+[Service]
+Type=oneshot
+# The same port as gpu-metrics-exporter.service: one vsock listener carries
+# both metrics and update commands. No TCP network access is required.
+ExecStart=/usr/local/bin/gpu-metrics-exporter update -auto -serverPort 9999
+# 75 (EX_TEMPFAIL, selfupdate.ExitTempFail): the update failed before it
+# changed anything -- the host update service is unavailable, or a transfer
+# did not check out. The next run tries again; until then, the update unit
+# need not show as failed three times a day. A failed install exits 1 and
+# fails the unit.
+SuccessExitStatus=75
+SyslogIdentifier=gpu-metrics-exporter-update

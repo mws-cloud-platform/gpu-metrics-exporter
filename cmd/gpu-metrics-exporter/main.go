@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"go.uber.org/zap/zapcore"
 
 	"go.mws.cloud/gpu-metrics-exporter/internal/log"
+	"go.mws.cloud/gpu-metrics-exporter/internal/selfupdate"
 	"go.mws.cloud/gpu-metrics-exporter/pkg/gpumetricsexporter"
 )
 
@@ -53,8 +55,21 @@ func getEnvInt(primaryKey, fallbackKey string, defaultVal int) (int, error) {
 	return i, nil
 }
 
+func defaultServerPort() (int, error) {
+	return getEnvInt("GPU_METRICS_EXPORTER_SERVER_PORT", "SERVER_PORT", 9999)
+}
+
 func main() {
-	defaultPort, err := getEnvInt("GPU_METRICS_EXPORTER_SERVER_PORT", "SERVER_PORT", 1234)
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "update":
+			os.Exit(runUpdate(os.Args[2:]))
+		case "auto-update":
+			os.Exit(runAutoUpdate(os.Args[2:]))
+		}
+	}
+
+	defaultPort, err := defaultServerPort()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Configuration error: %v\n", err)
 		os.Exit(1)
@@ -76,7 +91,24 @@ func main() {
 	instanceIdPath := flag.String("instanceIdPath", defaultInstanceIDPath, "path to cloud-init instance-id file (env: GPU_METRICS_EXPORTER_INSTANCE_ID_PATH, INSTANCE_ID_PATH)")
 	hostRoot := flag.String("hostRoot", defaultHostRoot, "path to host root filesystem mount (env: GPU_METRICS_EXPORTER_HOST_ROOT, HOST_ROOT)")
 	showVersion := flag.Bool("version", false, "print the version and exit")
+	flag.Usage = func() {
+		out := flag.CommandLine.Output()
+		_, _ = fmt.Fprintf(out, "Usage:\n  %s [flags]                               run the exporter\n", os.Args[0])
+		_, _ = fmt.Fprintf(out, "  %s update [-check] [-force] [-serverPort port]\n", os.Args[0])
+		_, _ = fmt.Fprintf(out, "      upgrade the installed package to the host's version\n")
+		_, _ = fmt.Fprintf(out, "  %s auto-update [enable|disable|status]   check for one every 8 hours, or stop doing so\n\nFlags:\n", os.Args[0])
+		flag.PrintDefaults()
+	}
 	flag.Parse()
+
+	// A stray argument would otherwise be ignored and the exporter started:
+	// a second one, in the foreground, next to the service. That is what
+	// releases up to 2026.10.06-1 do with `update`.
+	if flag.NArg() > 0 {
+		fmt.Fprintf(os.Stderr, "unexpected argument %q: the exporter takes only flags, and a command (update, auto-update) must be the first argument\n", flag.Arg(0))
+		flag.Usage()
+		os.Exit(2)
+	}
 
 	if *showVersion {
 		fmt.Printf("version: %s\n", version)
@@ -117,4 +149,111 @@ func run(logger *zap.Logger, cfg gpumetricsexporter.GpuMetricsExporterConfig) er
 	defer stop()
 
 	return gpumetricsexporter.NewGpuMetricsExporter(cfg).Run(ctx)
+}
+
+// runUpdate is `gpu-metrics-exporter update`: upgrade the installed package
+// to the version served by the host over the existing metrics vsock port
+// (internal/selfupdate). It returns the exit code.
+func runUpdate(args []string) int {
+	defaultPort, err := defaultServerPort()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Configuration error: %v\n", err)
+		return 1
+	}
+
+	fs := flag.NewFlagSet("update", flag.ContinueOnError)
+	check := fs.Bool("check", false, "only report whether the host has a newer package; change nothing (needs no root)")
+	force := fs.Bool("force", false, "install the host package even when it is not newer than the installed one, "+
+		"or while the service is stopped (it is left stopped)")
+	auto := fs.Bool("auto", false, fmt.Sprintf("run as auto-update's timer does: leave a stopped service alone, "+
+		"and exit %d when the update failed without changing anything", selfupdate.ExitTempFail))
+	port := fs.Int("serverPort", defaultPort, "server vsock port (env: GPU_METRICS_EXPORTER_SERVER_PORT, SERVER_PORT)")
+	fs.Usage = func() {
+		out := fs.Output()
+		_, _ = fmt.Fprintf(out, "Usage: %s update [-check] [-force] [-serverPort port]\n\n", os.Args[0])
+		_, _ = fmt.Fprintf(out, "Upgrade the installed gpu-metrics-exporter package to the version served by\n"+
+			"the host over the existing metrics vsock port, keeping its service enabled or disabled,\n"+
+			"running or stopped, as it was. Not for Kubernetes: there the DaemonSet's image is updated instead.\n\n")
+		fs.PrintDefaults()
+	}
+	if err := fs.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
+		return 2
+	}
+	if fs.NArg() > 0 {
+		fmt.Fprintf(os.Stderr, "update: unexpected argument %q\n", fs.Arg(0))
+		fs.Usage()
+		return 2
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	u := selfupdate.New(version, *port)
+	u.CheckOnly, u.Force, u.Auto = *check, *force, *auto
+	err = u.Update(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "update: %v\n", err)
+	}
+	return updateExitCode(err, *auto)
+}
+
+// updateExitCode is update's exit status. An automatic run that failed
+// before dpkg -i changed nothing, and exits selfupdate.ExitTempFail: the
+// next run tries again, and the update unit (SuccessExitStatus=75) does not
+// show as failed on a VM whose host update service is unavailable.
+func updateExitCode(err error, auto bool) int {
+	var installErr *selfupdate.InstallError
+	switch {
+	case err == nil:
+		return 0
+	case auto && !errors.As(err, &installErr):
+		return selfupdate.ExitTempFail
+	default:
+		return 1
+	}
+}
+
+// runAutoUpdate is `gpu-metrics-exporter auto-update [enable|disable|status]`:
+// turn the timer that runs `update -auto` on or off, or report on it.
+func runAutoUpdate(args []string) int {
+	usage := func() {
+		fmt.Fprintf(os.Stderr, "Usage: %s auto-update [enable|disable|status]\n\n"+
+			"Auto-update checks for a new host package every 8 hours and installs it as update\n"+
+			"does; it is on unless turned off. enable and disable need root; status, the\n"+
+			"default, does not. Not for Kubernetes: there the DaemonSet's image is updated.\n", os.Args[0])
+	}
+	cmd := "status"
+	switch {
+	case len(args) == 1:
+		cmd = args[0]
+	case len(args) > 1:
+		usage()
+		return 2
+	}
+
+	u := selfupdate.New(version, 0)
+	var err error
+	switch cmd {
+	case "enable":
+		err = u.SetAutoUpdate(true)
+	case "disable":
+		err = u.SetAutoUpdate(false)
+	case "status":
+		err = u.AutoUpdateStatus()
+	case "-h", "-help", "--help", "help":
+		usage()
+		return 0
+	default:
+		fmt.Fprintf(os.Stderr, "auto-update: unknown command %q\n", cmd)
+		usage()
+		return 2
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "auto-update: %v\n", err)
+		return 1
+	}
+	return 0
 }
