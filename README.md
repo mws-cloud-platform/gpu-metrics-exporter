@@ -26,8 +26,8 @@ where 3 (or another number >2) should be a unique guest VM ID (CID) on the host.
 The host vsock socket always has `cid = 2`.
 
 The host vsock specifies the port number on which it accepts incoming connections;
-the guest side uses this port to connect to the host. The CLI default is port 1234;
-the deployed systemd units (see `systemd/`) use port 9999.
+the guest side uses this port to connect to the host. The exporter CLI default is
+port 9999; the deployed systemd units (see `systemd/`) use the same port.
 
 So VSOCK provides socket-based client and server libraries;
 see `pkg/vsock` code.
@@ -464,7 +464,7 @@ The exporter supports configuration via both environment variables (with optiona
 
 | Environment Variable | CLI Flag | Default | Description |
 | --- | --- | --- | --- |
-| `GPU_METRICS_EXPORTER_SERVER_PORT` / `SERVER_PORT` | `-serverPort` | `1234` (systemd / k8s: `9999`) | Destination vsock port on host CID 2 |
+| `GPU_METRICS_EXPORTER_SERVER_PORT` / `SERVER_PORT` | `-serverPort` | `9999` | Destination vsock port on host CID 2 |
 | `GPU_METRICS_EXPORTER_TICK_PERIOD` / `TICK_PERIOD` | `-tickPeriod` | `10` (systemd / k8s: `60`) | Collection interval in seconds |
 | `GPU_METRICS_EXPORTER_LOG_LEVEL` / `LOG_LEVEL` | `-logLevel` | `info` | Logging level (`debug`, `info`, `warn`, `error`) |
 | `GPU_METRICS_EXPORTER_NVML_LIB_PATH` / `NVML_LIB_PATH` | `-nvmlLibPath` | `""` (auto) | Explicit path to `libnvidia-ml.so.1` |
@@ -508,14 +508,13 @@ On a VM where the exporter was installed from the `.deb`, one command upgrades
 it to the package served by its host and restarts the service:
 
 ```bash
-# The stock .deb units use shared vsock port 9999 (see below).
-sudo GPU_METRICS_EXPORTER_SERVER_PORT=9999 gpu-metrics-exporter update
-GPU_METRICS_EXPORTER_SERVER_PORT=9999 gpu-metrics-exporter update -check  # needs no root
+sudo gpu-metrics-exporter update
+gpu-metrics-exporter update -check  # needs no root
 ```
 
 The updater connects to host CID 2 on the **same vsock port used for metrics**.
 The receiver distinguishes the versioned update protocol by the first frame's
-magic, so no second listener or update-specific port flag exists. `GET_VERSION`
+magic, so no second listener is needed. `GET_VERSION`
 returns the host's version, package size and SHA-256. The guest then sends
 `READ(offset, length)` requests and receives up to 60 KiB per response, truncated
 at EOF, until the announced size has been downloaded. There is no HTTP client,
@@ -542,6 +541,7 @@ anyway and stops the service again right after.
 | --- | --- |
 | `-check` | Report whether the host has a newer package; change nothing |
 | `-force` | Install the host package even when it is not newer than the installed one, when the installed version cannot be compared (a development build), or while the service is stopped |
+| `-serverPort` | Host vsock port; overrides `GPU_METRICS_EXPORTER_SERVER_PORT` / `SERVER_PORT` |
 
 `update` refuses to run:
 
@@ -557,12 +557,12 @@ service. Upgrade those once by hand
 (`sudo dpkg -i gpu-metrics-exporter_<tag>_amd64.deb`). From then on, `update`
 works, and [auto-update](#auto-update) is on.
 
-Both the running exporter and `update` read `GPU_METRICS_EXPORTER_SERVER_PORT`,
-then `SERVER_PORT`, with CLI default 1234. The packaged exporter and update
-units both set `GPU_METRICS_EXPORTER_SERVER_PORT=9999`, matching the receiver
-unit. A custom exporter installation should configure the shared environment
-value rather than only overriding the exporter's `-serverPort` flag, so both
-processes continue to use one endpoint. No TCP connectivity, DNS, HTTPS proxy
+Both the running exporter and `update` accept `-serverPort` and read
+`GPU_METRICS_EXPORTER_SERVER_PORT`, then `SERVER_PORT`, with CLI default 9999;
+an explicit flag overrides the environment. The packaged exporter and update
+units both pass `-serverPort 9999`, matching the receiver unit. A custom
+exporter installation must configure the same port for `update`, using either
+its flag or the shared environment value. No TCP connectivity, DNS, HTTPS proxy
 or GitHub access is needed by the new updater.
 
 The frame hashes protect individual responses and SHA-256 checks the complete

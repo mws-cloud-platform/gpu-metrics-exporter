@@ -6,8 +6,7 @@ After=network-online.target
 Type=simple
 User=root
 Group=root
-Environment=GPU_METRICS_EXPORTER_SERVER_PORT=9999
-ExecStart=/usr/local/bin/gpu-metrics-exporter -tickPeriod 60
+ExecStart=/usr/local/bin/gpu-metrics-exporter -serverPort 9999 -tickPeriod 60
 Restart=always
 RestartSec=1min
 StandardOutput=journal

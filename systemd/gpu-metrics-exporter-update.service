@@ -9,8 +9,7 @@ Documentation=https://github.com/mws-cloud-platform/gpu-metrics-exporter#auto-up
 Type=oneshot
 # The same port as gpu-metrics-exporter.service: one vsock listener carries
 # both metrics and update commands. No TCP network access is required.
-Environment=GPU_METRICS_EXPORTER_SERVER_PORT=9999
-ExecStart=/usr/local/bin/gpu-metrics-exporter update -auto
+ExecStart=/usr/local/bin/gpu-metrics-exporter update -auto -serverPort 9999
 # 75 (EX_TEMPFAIL, selfupdate.ExitTempFail): the update failed before it
 # changed anything -- the host update service is unavailable, or a transfer
 # did not check out. The next run tries again; until then, the update unit

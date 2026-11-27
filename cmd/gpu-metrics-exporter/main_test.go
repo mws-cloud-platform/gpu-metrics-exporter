@@ -3,6 +3,9 @@ package main
 import (
 	"errors"
 	"fmt"
+	"io"
+	"os"
+	"strings"
 	"testing"
 
 	"go.mws.cloud/gpu-metrics-exporter/internal/selfupdate"
@@ -87,19 +90,49 @@ func TestGetEnvInt(t *testing.T) {
 func TestDefaultServerPortIsShared(t *testing.T) {
 	t.Setenv("GPU_METRICS_EXPORTER_SERVER_PORT", "")
 	t.Setenv("SERVER_PORT", "")
-	if got, err := defaultServerPort(); err != nil || got != 1234 {
+	if got, err := defaultServerPort(); err != nil || got != 9999 {
 		t.Fatalf("defaultServerPort default = %d, %v", got, err)
 	}
-	t.Setenv("SERVER_PORT", "9999")
-	if got, err := defaultServerPort(); err != nil || got != 9999 {
+	t.Setenv("SERVER_PORT", "10000")
+	if got, err := defaultServerPort(); err != nil || got != 10000 {
 		t.Fatalf("defaultServerPort fallback = %d, %v", got, err)
 	}
-	t.Setenv("GPU_METRICS_EXPORTER_SERVER_PORT", "10000")
-	if got, err := defaultServerPort(); err != nil || got != 10000 {
+	t.Setenv("GPU_METRICS_EXPORTER_SERVER_PORT", "10001")
+	if got, err := defaultServerPort(); err != nil || got != 10001 {
 		t.Fatalf("defaultServerPort primary = %d, %v", got, err)
 	}
 	t.Setenv("GPU_METRICS_EXPORTER_SERVER_PORT", "invalid")
 	if _, err := defaultServerPort(); err == nil {
 		t.Fatal("defaultServerPort accepted invalid shared port")
+	}
+}
+
+func TestUpdateHelpShowsSharedServerPort(t *testing.T) {
+	t.Setenv("GPU_METRICS_EXPORTER_SERVER_PORT", "10000")
+	t.Setenv("SERVER_PORT", "")
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = r.Close() }()
+	stderr := os.Stderr
+	os.Stderr = w
+	code := runUpdate([]string{"-h"})
+	os.Stderr = stderr
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	output, err := io.ReadAll(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code != 0 {
+		t.Fatalf("update -h exit code = %d, want 0", code)
+	}
+	for _, want := range []string{"-serverPort int", "default 10000"} {
+		if !strings.Contains(string(output), want) {
+			t.Errorf("update -h output does not contain %q:\n%s", want, output)
+		}
 	}
 }

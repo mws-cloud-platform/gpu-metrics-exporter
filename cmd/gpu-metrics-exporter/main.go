@@ -56,7 +56,7 @@ func getEnvInt(primaryKey, fallbackKey string, defaultVal int) (int, error) {
 }
 
 func defaultServerPort() (int, error) {
-	return getEnvInt("GPU_METRICS_EXPORTER_SERVER_PORT", "SERVER_PORT", 1234)
+	return getEnvInt("GPU_METRICS_EXPORTER_SERVER_PORT", "SERVER_PORT", 9999)
 }
 
 func main() {
@@ -94,7 +94,8 @@ func main() {
 	flag.Usage = func() {
 		out := flag.CommandLine.Output()
 		_, _ = fmt.Fprintf(out, "Usage:\n  %s [flags]                               run the exporter\n", os.Args[0])
-		_, _ = fmt.Fprintf(out, "  %s update [-check] [-force]              upgrade the installed package to the host's version\n", os.Args[0])
+		_, _ = fmt.Fprintf(out, "  %s update [-check] [-force] [-serverPort port]\n", os.Args[0])
+		_, _ = fmt.Fprintf(out, "      upgrade the installed package to the host's version\n")
 		_, _ = fmt.Fprintf(out, "  %s auto-update [enable|disable|status]   check for one every 8 hours, or stop doing so\n\nFlags:\n", os.Args[0])
 		flag.PrintDefaults()
 	}
@@ -154,15 +155,22 @@ func run(logger *zap.Logger, cfg gpumetricsexporter.GpuMetricsExporterConfig) er
 // to the version served by the host over the existing metrics vsock port
 // (internal/selfupdate). It returns the exit code.
 func runUpdate(args []string) int {
+	defaultPort, err := defaultServerPort()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Configuration error: %v\n", err)
+		return 1
+	}
+
 	fs := flag.NewFlagSet("update", flag.ContinueOnError)
 	check := fs.Bool("check", false, "only report whether the host has a newer package; change nothing (needs no root)")
 	force := fs.Bool("force", false, "install the host package even when it is not newer than the installed one, "+
 		"or while the service is stopped (it is left stopped)")
 	auto := fs.Bool("auto", false, fmt.Sprintf("run as auto-update's timer does: leave a stopped service alone, "+
 		"and exit %d when the update failed without changing anything", selfupdate.ExitTempFail))
+	port := fs.Int("serverPort", defaultPort, "server vsock port (env: GPU_METRICS_EXPORTER_SERVER_PORT, SERVER_PORT)")
 	fs.Usage = func() {
 		out := fs.Output()
-		_, _ = fmt.Fprintf(out, "Usage: %s update [-check] [-force]\n\n", os.Args[0])
+		_, _ = fmt.Fprintf(out, "Usage: %s update [-check] [-force] [-serverPort port]\n\n", os.Args[0])
 		_, _ = fmt.Fprintf(out, "Upgrade the installed gpu-metrics-exporter package to the version served by\n"+
 			"the host over the existing metrics vsock port, keeping its service enabled or disabled,\n"+
 			"running or stopped, as it was. Not for Kubernetes: there the DaemonSet's image is updated instead.\n\n")
@@ -180,16 +188,10 @@ func runUpdate(args []string) int {
 		return 2
 	}
 
-	port, err := defaultServerPort()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Configuration error: %v\n", err)
-		return 1
-	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	u := selfupdate.New(version, port)
+	u := selfupdate.New(version, *port)
 	u.CheckOnly, u.Force, u.Auto = *check, *force, *auto
 	err = u.Update(ctx)
 	if err != nil {
